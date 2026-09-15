@@ -40,6 +40,7 @@ PROFILE_COLUMNS = ["name", "goal_race", "goal_seconds", "race_date", "days_per_w
 RUN_COLUMNS = ["profile", "date", "name", "type", "distance_km", "moving_seconds",
                "elevation_m", "avg_hr"]
 
+DEMO_PROFILE = "Demo athlete"
 
 
 # --------------------------------------------------------------------------

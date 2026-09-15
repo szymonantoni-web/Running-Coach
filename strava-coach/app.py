@@ -21,6 +21,7 @@ import ocr
 import storage
 from physiology import (
     COMMON_RACES,
+    MARATHON_M,
     easy_pace_range,
     format_duration,
     format_pace,
@@ -35,10 +36,13 @@ from plan import (
     assess_goal,
     next_session,
     phase_for,
+    typical_peak_volume,
     weekly_volume_target,
 )
 from strava import append_runs, best_efforts, load_activities
 from training_load import acwr, add_derived, recent_context, weekly_summary
+
+DEMO_PATH = Path(__file__).parent / "data" / "sample_activities.csv"
 
 st.set_page_config(page_title="Strava Coach", page_icon="🏃", layout="wide",
                    initial_sidebar_state="expanded")
@@ -72,6 +76,11 @@ def show_table(frame, **kwargs) -> None:
         st.dataframe(frame, width="stretch", **kwargs)
     except TypeError:
         st.dataframe(frame, use_container_width=True, **kwargs)
+
+
+@st.cache_data(show_spinner=False)
+def _load_demo() -> pd.DataFrame:
+    return load_activities(DEMO_PATH)
 
 
 @st.cache_data(show_spinner=False)
@@ -138,6 +147,10 @@ def _get_store(_generation: int = 0) -> storage.StoreStatus:
 def _load_profile(_store, name: str, version: int):
     """`version` is bumped on every write, which is what invalidates the cache.
     `_store` is underscore-prefixed so Streamlit does not try to hash it."""
+    if name == storage.DEMO_PROFILE:
+        demo = storage.Profile(name=name, goal_race="Marathon", goal_seconds=3 * 3600,
+                               race_date=date(2027, 5, 16), days_per_week=4)
+        return demo, _load_demo()
     return _store.load(name)
 
 
@@ -153,17 +166,16 @@ st.session_state.setdefault("data_version", 0)
 st.sidebar.title("🏃 Strava Coach")
 
 known_profiles = store.list_profiles()
-options = known_profiles + [NEW_PROFILE]
-
-# With no profiles saved, the only sensible destination is the create screen.
-st.session_state.setdefault("active_profile", known_profiles[0] if known_profiles else NEW_PROFILE)
+options = [storage.DEMO_PROFILE] + known_profiles + [NEW_PROFILE]
+st.session_state.setdefault("active_profile", storage.DEMO_PROFILE)
 if st.session_state["active_profile"] not in options:
-    st.session_state["active_profile"] = known_profiles[0] if known_profiles else NEW_PROFILE
+    st.session_state["active_profile"] = storage.DEMO_PROFILE
 
 chosen = st.sidebar.selectbox("Profile", options,
                               index=options.index(st.session_state["active_profile"]))
 if chosen != st.session_state["active_profile"]:
     st.session_state["active_profile"] = chosen
+    st.session_state.pop("added_runs", None)
     _rerun_now()
 
 # -- storage status --------------------------------------------------------
@@ -187,26 +199,22 @@ if store_status.error:
 
 # -- creating a profile ----------------------------------------------------
 if chosen == NEW_PROFILE:
-    first_ever = not known_profiles
-    st.title("Welcome" if first_ever else "New profile")
+    st.title("New profile")
     st.markdown(
-        ("Nothing saved here yet. A profile holds one runner's history, goal race and "
-         "target time — create one to get started.\n\n"
-         if first_ever else
-         "A profile holds one runner's history, goal race and target time.\n\n") +
-        "Profiles are named, not private: everyone who can open this app sees all of "
-        "them and can edit them."
+        "A profile holds one athlete's run history, goal race and target time. "
+        "You and anyone else using this app can see every profile — they are named, "
+        "not private."
     )
     new_name = st.text_input("Profile name", placeholder="e.g. Szymon, or Marta — half marathon")
     clean_name = new_name.strip()
-    clash = clean_name in known_profiles
+    clash = clean_name in known_profiles or clean_name == storage.DEMO_PROFILE
 
     if clash:
         st.error(f"There is already a profile called “{clean_name}”.")
     if not store_status.durable:
         st.warning(
-            "Storage is not durable here, so a profile created now will not survive a "
-            "restart. Set up Google Sheets first — see the README."
+            "Storage is not durable on this deploy, so a profile created now will not "
+            "survive a restart. Set up Google Sheets first — see the README."
         )
 
     if st.button("Create profile", type="primary", disabled=not clean_name or clash):
@@ -214,51 +222,53 @@ if chosen == NEW_PROFILE:
         _bump()
         st.session_state["active_profile"] = clean_name
         _rerun_now()
-
-    if first_ever:
-        st.caption(
-            "Once it exists, import your Strava export into it in one go: on strava.com, "
-            "**Settings → My Account → Download or Delete Your Account → Request your "
-            "archive**, then upload the `activities.csv` from the zip."
-        )
     st.stop()
 
 profile_name = chosen
+is_demo = profile_name == storage.DEMO_PROFILE
 profile, runs = _load_profile(store, profile_name, st.session_state["data_version"])
+
+# The demo profile is read-only, so additions to it are held in the session.
+st.session_state.setdefault("added_runs", [])
+if is_demo and st.session_state["added_runs"]:
+    runs = append_runs(runs, st.session_state["added_runs"])
 
 
 def save_runs(updated: pd.DataFrame) -> None:
     """Persist a changed run history for the active profile."""
+    if is_demo:
+        return                       # handled by session state instead
     store.save(profile, updated)
     _bump()
 
 
 # -- importing a history ---------------------------------------------------
-with st.sidebar.expander("Import a Strava export", expanded=runs.empty):
-    st.caption(
-        "One-time bootstrap. On strava.com: **Settings → My Account → Download or "
-        "Delete Your Account → Request your archive**. Upload the `activities.csv` "
-        "from inside the zip."
-    )
-    uploaded = st.file_uploader("activities.csv", type=["csv"], key="history_upload")
-    assume_miles = st.checkbox("That account is set to miles", value=False, key="import_miles")
-    replace = st.radio("If this profile already has runs", ["Merge", "Replace"],
-                       horizontal=True, key="import_mode")
-    if uploaded is not None and st.button("Import into this profile", key="do_import"):
-        try:
-            imported = _load_upload(uploaded.getvalue(), assume_miles)
-            merged = imported if replace == "Replace" else append_runs(runs, [
-                {"date": row["date"], "name": row["name"],
-                 "distance_km": row["distance_km"], "moving_seconds": row["moving_seconds"],
-                 "avg_hr": row.get("avg_hr"), "elevation_m": row.get("elevation_m")}
-                for _, row in imported.iterrows()
-            ])
-            store.save(profile, merged)
-            _bump()
-            st.success(f"Imported {len(imported)} runs.")
-            _rerun_now()
-        except Exception as error:  # noqa: BLE001
-            st.error(str(error))
+if not is_demo:
+    with st.sidebar.expander("Import a Strava export", expanded=runs.empty):
+        st.caption(
+            "One-time bootstrap. On strava.com: **Settings → My Account → Download or "
+            "Delete Your Account → Request your archive**. Upload the `activities.csv` "
+            "from inside the zip."
+        )
+        uploaded = st.file_uploader("activities.csv", type=["csv"], key="history_upload")
+        assume_miles = st.checkbox("That account is set to miles", value=False, key="import_miles")
+        replace = st.radio("If this profile already has runs", ["Merge", "Replace"],
+                           horizontal=True, key="import_mode")
+        if uploaded is not None and st.button("Import into this profile", key="do_import"):
+            try:
+                imported = _load_upload(uploaded.getvalue(), assume_miles)
+                merged = imported if replace == "Replace" else append_runs(runs, [
+                    {"date": row["date"], "name": row["name"],
+                     "distance_km": row["distance_km"], "moving_seconds": row["moving_seconds"],
+                     "avg_hr": row.get("avg_hr"), "elevation_m": row.get("elevation_m")}
+                    for _, row in imported.iterrows()
+                ])
+                store.save(profile, merged)
+                _bump()
+                st.success(f"Imported {len(imported)} runs.")
+                _rerun_now()
+            except Exception as error:  # noqa: BLE001
+                st.error(str(error))
 
 if runs is None or runs.empty:
     st.title(profile_name)
@@ -271,6 +281,9 @@ if runs is None or runs.empty:
     st.stop()
 
 st.sidebar.divider()
+if is_demo:
+    st.sidebar.info("The demo athlete is read-only — changes are not saved. "
+                    "Create a profile to keep your own history.")
 
 # -- current fitness -------------------------------------------------------
 st.sidebar.subheader("Current fitness")
@@ -368,39 +381,38 @@ goal = Goal(distance_m=COMMON_RACES[race_label], goal_seconds=goal_seconds,
             race_date=pd.Timestamp(race_date), days_per_week=days_per_week, label=race_label)
 
 # -- saving settings -------------------------------------------------------
-unsaved = (profile.goal_race != race_label
-           or abs(profile.goal_seconds - goal_seconds) > 0.5
-           or profile.race_date != race_date
-           or profile.days_per_week != days_per_week
-           or (profile.effort_km or 0) != round(effort_km, 3)
-           or (profile.effort_seconds or 0) != round(effort_seconds)
-           or profile.effort_date != effort_date)
+if not is_demo:
+    unsaved = (profile.goal_race != race_label
+               or abs(profile.goal_seconds - goal_seconds) > 0.5
+               or profile.race_date != race_date
+               or profile.days_per_week != days_per_week
+               or (profile.effort_km or 0) != round(effort_km, 3)
+               or (profile.effort_seconds or 0) != round(effort_seconds)
+               or profile.effort_date != effort_date)
 
-if st.sidebar.button("💾 Save settings to profile", type="primary" if unsaved else "secondary",
-                     disabled=not unsaved):
-    profile.goal_race = race_label
-    profile.goal_seconds = goal_seconds
-    profile.race_date = race_date
-    profile.days_per_week = days_per_week
-    profile.effort_km = round(effort_km, 3)
-    profile.effort_seconds = round(effort_seconds)
-    profile.effort_date = effort_date
-    store.save(profile, runs)
-    _bump()
-    _rerun_now()
-st.sidebar.caption("Runs are saved the moment you add them. Goal and fitness "
-                   "settings are saved with this button.")
+    if st.sidebar.button("💾 Save settings to profile", type="primary" if unsaved else "secondary",
+                         disabled=not unsaved):
+        profile.goal_race = race_label
+        profile.goal_seconds = goal_seconds
+        profile.race_date = race_date
+        profile.days_per_week = days_per_week
+        profile.effort_km = round(effort_km, 3)
+        profile.effort_seconds = round(effort_seconds)
+        profile.effort_date = effort_date
+        store.save(profile, runs)
+        _bump()
+        _rerun_now()
+    st.sidebar.caption("Runs are saved the moment you add them. Goal and fitness "
+                       "settings are saved with this button.")
 
-with st.sidebar.expander("Delete this profile"):
-    st.caption(f"Permanently removes “{profile_name}” and all of its runs.")
-    if st.text_input("Type the profile name to confirm", key="delete_confirm") == profile_name:
-        if st.button("Delete permanently"):
-            store.delete(profile_name)
-            _bump()
-            # Fall back to whichever profile remains, or the create screen.
-            remaining = [name for name in store.list_profiles() if name != profile_name]
-            st.session_state["active_profile"] = remaining[0] if remaining else NEW_PROFILE
-            _rerun_now()
+    with st.sidebar.expander("Delete this profile"):
+        st.caption(f"Permanently removes “{profile_name}” and all of its runs.")
+        if st.text_input("Type the profile name to confirm", key="delete_confirm") == profile_name:
+            if st.button("Delete permanently"):
+                store.delete(profile_name)
+                _bump()
+                st.session_state["active_profile"] = storage.DEMO_PROFILE
+                _rerun_now()
 
 today = pd.Timestamp(pd.Timestamp.today().date())
 as_of = max(today, runs["date"].max())
@@ -577,7 +589,11 @@ def _run_form(parsed: "ocr.ParsedRun | None", fingerprint: str | None) -> None:
             "avg_hr": float(avg_hr) if avg_hr else None,
             "elevation_m": float(elevation) if elevation else None,
         }
-        save_runs(append_runs(runs, [entry]))
+        if is_demo:
+            # The demo profile is read-only, so its additions stay in the session.
+            st.session_state["added_runs"].append(entry)
+        else:
+            save_runs(append_runs(runs, [entry]))
         if fingerprint:
             st.session_state["processed_shots"].append(fingerprint)
         _rerun_now()
@@ -661,14 +677,17 @@ with add_tab:
         columns[1].write(pd.Timestamp(row["date"]).strftime("%a %d %b"))
         columns[2].write(f"{row['distance_km']:.2f} km")
         columns[3].write(format_pace(row["pace_sec_per_km"]))
-        if columns[4].button("✕", key=f"remove_{position}",
-                             help="Delete this run from the profile"):
+        if not is_demo and columns[4].button("✕", key=f"remove_{position}",
+                                             help="Delete this run from the profile"):
             keep = runs.drop(index=row.name)
             save_runs(keep)
             st.session_state["processed_shots"] = []
             _rerun_now()
 
-    if store_status.durable:
+    if is_demo:
+        st.caption("The demo profile is read-only — runs added here disappear when you "
+                   "close the tab. Create your own profile to keep them.")
+    elif store_status.durable:
         st.success(f"Runs are saved to **{store_status.label}** the moment you add them, "
                    "and the recommendation on the Next session tab is already updated.")
     else:

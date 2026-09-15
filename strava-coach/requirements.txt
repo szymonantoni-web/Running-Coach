@@ -1,0 +1,14 @@
+# Streamlit Community Cloud installs exactly this on every deploy.
+# Altair ships with Streamlit, so the charts need no extra package.
+streamlit>=1.40
+pandas>=2.1
+
+# Screenshot reading. pytesseract is only a wrapper — the tesseract binary
+# itself comes from packages.txt in the repository root.
+pytesseract>=0.3.10
+Pillow>=10.0
+
+# Saving profiles to Google Sheets. Optional: without credentials the app
+# falls back to local files and these simply go unused.
+gspread>=6.0
+google-auth>=2.30

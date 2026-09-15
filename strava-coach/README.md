@@ -47,7 +47,7 @@ the sidebar — and the date it was run is saved with the profile. Both matter:
 ranking across a whole imported history surfaces the fastest run of the year, and
 a VDOT taken from a months-old effort then propagates into every training pace,
 every race prediction and the goal verdict, describing fitness you may no longer
-have. On the test data an 8-week window versus a 4-week one is 1.7 VDOT points —
+have. On the demo data an 8-week window versus a 4-week one is 1.7 VDOT points —
 seven minutes of predicted marathon. If a saved effort falls outside the window,
 the app says so rather than quietly carrying on.
 
@@ -120,8 +120,8 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-It opens at `http://localhost:8501`. With nothing saved yet you get a create-a-profile
-screen; make one, then import a Strava export into it.
+It opens at `http://localhost:8501` with a demo athlete loaded — a 4-days-a-week
+marathon build — so you can see it working before uploading anything.
 
 Tests: `pytest`, or `python tests/test_coach.py` and `python tests/test_ocr.py`.
 
@@ -224,6 +224,9 @@ That is deliberate for a couple of people training together; if you need real
 separation, restrict the deployed app instead (Streamlit Cloud can limit access
 to specific Google accounts).
 
+The **Demo athlete** is built in and read-only, so the app works before you have
+set anything up.
+
 ### Why this needs storage at all
 
 Streamlit Community Cloud's filesystem is **ephemeral**. Anything the app writes
@@ -313,7 +316,7 @@ strava.py                    Loading and cleaning the export (and the API shape)
 ocr.py                       Screenshot reading: Tesseract, then text → structure
 storage.py                   Profiles, and the local-file / Google Sheets backends
 charts.py                    Altair chart builders
-data/sample_activities.csv   Synthetic history the tests run against
+data/sample_activities.csv   The demo athlete
 tests/test_coach.py          37 tests, including checks against Daniels' tables
 tests/test_ocr.py            25 tests, including end-to-end through real Tesseract
 tests/test_storage.py        27 tests, both backends through the same assertions

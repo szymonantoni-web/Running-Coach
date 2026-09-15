@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Secrets — never commit these
+.env
+.streamlit/secrets.toml
+
+# Your own Strava data stays off GitHub. The bundled demo file is committed
+# deliberately; anything else under data/ is yours.
+data/*
+!data/sample_activities.csv
+export_*/
+activities.csv
+*.gpx
+*.fit
+*.tcx
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Saved profiles, when running with the local-file backend. Your training
+# history is yours — it does not belong in the repository.
+data/profiles/
