@@ -37,8 +37,12 @@ RUNS_SHEET = "runs"
 
 PROFILE_COLUMNS = ["name", "goal_race", "goal_seconds", "race_date", "days_per_week",
                    "effort_km", "effort_seconds", "effort_date", "updated_at"]
+# `session_type` was added after the first release. Rows are read by header
+# name and the whole sheet is rewritten on every save, so an existing sheet
+# without the column loads fine (blank = decide from the data) and gains it on
+# the next save. Never reorder these — only append.
 RUN_COLUMNS = ["profile", "date", "name", "type", "distance_km", "moving_seconds",
-               "elevation_m", "avg_hr"]
+               "elevation_m", "avg_hr", "session_type"]
 
 
 
@@ -173,6 +177,7 @@ def runs_to_rows(profile_name: str, runs: pd.DataFrame) -> list[list[str]]:
             f"{float(run['moving_seconds']):.0f}",
             "" if _clean(run.get("elevation_m")) is None else f"{float(run['elevation_m']):.0f}",
             "" if _clean(run.get("avg_hr")) is None else f"{float(run['avg_hr']):.0f}",
+            str(_clean(run.get("session_type")) or ""),
         ])
     return rows
 
@@ -201,11 +206,13 @@ def rows_to_runs(rows: list[dict], profile_name: str | None = None) -> pd.DataFr
             "elevation_m": _as_float(row.get("elevation_m")),
             "avg_hr": _as_float(row.get("avg_hr")),
             "max_hr": None,
+            "session_type": str(_clean(row.get("session_type")) or ""),
         })
 
     if not records:
         return pd.DataFrame(columns=["date", "name", "type", "distance_km", "moving_seconds",
-                                     "elevation_m", "avg_hr", "max_hr", "pace_sec_per_km"])
+                                     "elevation_m", "avg_hr", "max_hr", "session_type",
+                                     "pace_sec_per_km"])
 
     frame = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
     frame["pace_sec_per_km"] = frame["moving_seconds"] / frame["distance_km"]

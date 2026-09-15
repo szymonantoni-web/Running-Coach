@@ -220,8 +220,12 @@ def append_runs(runs: pd.DataFrame, added: list[dict]) -> pd.DataFrame:
         "elevation_m": row.get("elevation_m"),
         "avg_hr": row.get("avg_hr"),
         "max_hr": row.get("max_hr"),
+        # What the runner said this session was. Empty means "work it out".
+        "session_type": str(row.get("session_type") or ""),
     } for row in added])
 
+    if not runs.empty and "session_type" not in runs.columns:
+        runs = runs.assign(session_type="")
     combined = pd.concat([runs, extra], ignore_index=True) if not runs.empty else extra
     combined["pace_sec_per_km"] = combined["moving_seconds"] / combined["distance_km"]
     combined = combined.sort_values("date").reset_index(drop=True)

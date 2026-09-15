@@ -30,7 +30,14 @@ from physiology import (
     predict_race_seconds,
     vdot_for_target,
 )
-from training_load import LoadState, RecentContext
+from training_load import (
+    LoadState,
+    RecentContext,
+    acwr,
+    classify_intensity,
+    recent_context,
+    session_load,
+)
 
 # -- tunable conventions ---------------------------------------------------
 MAX_WEEKLY_RAMP = 1.08          # volume increase per week in a build phase
@@ -367,6 +374,25 @@ class Prescription:
     rationale: str
     status: str = "good"
     alternatives: list[str] = field(default_factory=list)
+    # Estimated average pace for the whole session, recoveries and warm-up
+    # included. Only used to project a week forward; nan where meaningless.
+    avg_pace_sec: float = math.nan
+    # Kilometres of the session run faster than easy. The rest is warm-up,
+    # cool-down and jog recoveries — which is most of a "hard" session.
+    hard_km: float = 0.0
+
+
+def _blend(total_km: float, work_km: float, work_pace: float, easy_pace: float) -> float:
+    """Average pace over a whole session, warm-up and recoveries included.
+
+    A threshold session is not run at threshold pace: most of its distance is
+    easy. Projecting a week forward needs the honest session average, because
+    that is what the load calculation sees.
+    """
+    work_km = max(0.0, min(work_km, total_km))
+    if total_km <= 0 or not math.isfinite(work_pace) or not math.isfinite(easy_pace):
+        return math.nan
+    return (work_km * work_pace + (total_km - work_km) * easy_pace) / total_km
 
 
 def _pace_window(pace_sec: float, tolerance: int = 5) -> str:
@@ -390,6 +416,7 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
     quality, then easy."""
     racing = race_profile(goal.distance_m)
     easy_window = f"{format_pace(zones['easy'])} – {format_pace(easy_slow_sec)}"
+    easy_avg = (zones["easy"] + easy_slow_sec) / 2.0
     remaining = weekly_target_km - context.last_7_km if math.isfinite(weekly_target_km) else math.nan
 
     # 1. Recovery overrides everything.
@@ -413,6 +440,7 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
             "spike pattern worth interrupting deliberately — hold easy until it settles under 1.3.",
             status="critical",
             alternatives=["A rest day works equally well here."],
+            avg_pace_sec=easy_avg,
         )
 
     # 2. Coming back from a gap — ease in before anything else.
@@ -428,6 +456,7 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
             "long run or a session.",
             status="warning",
             alternatives=["If the break was illness rather than choice, add a day and keep it shorter still."],
+            avg_pace_sec=easy_avg,
         )
 
     # 3. The long run is the week's anchor.
@@ -442,7 +471,13 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
         elif phase.name == "Peak":
             target = min(longest + 2.0, cap)
 
-        if phase.name in ("Peak", "Build") and racing.race_pace_work:
+        # Race-pace segments make this a quality session, so it has to respect
+        # the same spacing as one. Without this check the long run was being
+        # prescribed with segments two days after a threshold session — the
+        # long-run branch sits above the quality branch in the tree and was
+        # never consulting days_since_quality.
+        segments_ok = context.days_since_quality >= MIN_DAYS_BETWEEN_QUALITY
+        if phase.name in ("Peak", "Build") and racing.race_pace_work and segments_ok:
             # Goal pace is simply the target time over the target distance — no model
             # needed. Fall back to the VDOT marathon zone if no goal time is set.
             race_pace = (goal.goal_seconds / (goal.distance_m / 1000.0)
@@ -462,6 +497,8 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
                 "you are already tired.",
                 alternatives=[f"If you are flat, drop the segments and run all {target:.0f} km easy — "
                               "the distance is worth more than the pace."],
+                avg_pace_sec=_blend(target, 2 * segment, race_pace, easy_avg),
+                hard_km=2 * segment,
             )
 
         return Prescription(
@@ -473,8 +510,13 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
             "builds the aerobic base and fatigue resistance nothing else does — it matters for every "
             f"distance, though it carries more of the work the longer the race. Capped at "
             f"{racing.long_run_cap_km:.0f} km here, which is what {racing.label.lower()} asks for. "
-            "Keep it genuinely easy; the benefit is the duration, not the pace.",
+            "Keep it genuinely easy; the benefit is the duration, not the pace."
+            + ("" if segments_ok or not racing.race_pace_work else
+               f" No race-pace segments today — it is only "
+               f"{_days(context.days_since_quality)} days since your last quality session, and a long "
+               "run with segments is a hard day whatever the pace of the first 14 km."),
             alternatives=["Split into two runs the same day only if the full distance is not realistic yet."],
+            avg_pace_sec=easy_avg,
         )
 
     # 4. Quality, if recovered and load allows.
@@ -492,12 +534,16 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
                     f"Reps {_pace_window(interval, 4)}",
                     f"Taper work for {racing.label.lower()} keeps race rhythm without adding fatigue: "
                     f"race intensity, a fraction of the volume. Short reps because {racing.why}.",
+                    avg_pace_sec=_blend(7.0, 1.6, interval, easy_avg),
+                    hard_km=1.6,
                 )
             return Prescription(
                 "Sharpener", 8.0,
                 f"2 km easy → 3 × 1 km at threshold ({format_pace(threshold)}) with 2 min jog → 2 km easy.",
                 f"Reps {_pace_window(threshold)}",
                 "Taper work keeps the legs sharp without adding fatigue: same intensity, much less of it.",
+                avg_pace_sec=_blend(8.0, 3.0, threshold, easy_avg),
+                hard_km=3.0,
             )
 
         # Which session carries the block depends on the race. A 5 km is run near
@@ -526,6 +572,8 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
                 "next three days.",
                 alternatives=[f"Feeling flat? Make it {reps - 1} × {rep_m} m rather than pushing through "
                               f"{reps} bad ones."],
+                avg_pace_sec=_blend(total, reps * rep_m / 1000.0, interval, easy_slow_sec),
+                hard_km=reps * rep_m / 1000.0,
             )
 
         rep_km = 1.0 if speed_race else 2.0
@@ -547,6 +595,8 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
             f"{_days(context.days_since_quality)} days since quality work, load at "
             f"{load.ratio:.2f}× your norm. " + why_threshold,
             alternatives=["A continuous 20–30 min tempo works too if you prefer it to broken reps."],
+            avg_pace_sec=_blend(reps * rep_km + 4.0, reps * rep_km, threshold, easy_avg),
+            hard_km=reps * rep_km,
         )
 
     # 5. Otherwise, easy.
@@ -564,4 +614,203 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
         reason + " Easy running is not filler — it is where most of the aerobic adaptation happens, "
                  "and it only works if it is actually easy.",
         alternatives=["Split it or shorten it if time is tight; consistency matters more than the exact distance."],
+        avg_pace_sec=easy_avg,
+    )
+
+
+# --------------------------------------------------------------------------
+# The week ahead
+#
+# `next_session` answers one question: what should today be. Projecting seven
+# days means asking it seven times — but each answer changes the training
+# history the next one reads, so the days cannot simply be asked in parallel.
+#
+# The approach here is to simulate: prescribe a day, write that session into a
+# copy of the run history as though it had been run exactly as given, then ask
+# again from the new history. That reuses the real load and context maths
+# rather than a parallel approximation that would drift out of step with it.
+#
+# The output is a projection, not a plan. It assumes you run every session as
+# prescribed, that nothing hurts, and that the weather cooperates. Run
+# something different on Tuesday and Wednesday onward changes — which is the
+# point of a rules engine rather than a fixed schedule.
+# --------------------------------------------------------------------------
+
+@dataclass
+class PlannedDay:
+    date: pd.Timestamp
+    prescription: Prescription | None      # None on a rest day
+    rest_reason: str = ""
+    phase_name: str = ""
+    load_ratio: float = math.nan
+
+    @property
+    def weekday(self) -> str:
+        return self.date.strftime("%a")
+
+    @property
+    def is_rest(self) -> bool:
+        return self.prescription is None
+
+    @property
+    def distance_km(self) -> float:
+        return 0.0 if self.prescription is None else self.prescription.distance_km
+
+
+@dataclass
+class WeekOutlook:
+    days: list[PlannedDay]
+    total_km: float
+    quality_sessions: int
+    longest_km: float
+    easy_share: float
+    target_km: float
+    end_ratio: float
+    caveat: str
+    shortfall: str = ""
+
+
+QUALITY_KINDS = ("Threshold", "Intervals", "Sharpener")
+
+
+def is_quality_kind(kind: str) -> bool:
+    """Does this prescription count as a hard session?
+
+    Deliberately keyed off what the engine *prescribed* rather than off the
+    session's average pace. A threshold session is mostly easy running by
+    distance — 6 km of reps inside a 10 km session — so its average pace can
+    land in the easy band and the intensity classifier will call it easy. That
+    is correct for a run someone actually did (the classifier only ever sees an
+    average), but wrong here, where the structure is known. Reading it back off
+    the average made the projection prescribe threshold on four consecutive
+    days, because `days_since_quality` never reset.
+    """
+    return kind.startswith(QUALITY_KINDS) or "pace work" in kind
+
+
+def _synthetic_run(date: pd.Timestamp, prescription: Prescription,
+                   zones: dict[str, float], easy_slow_sec: float) -> dict:
+    """The row this session would add to the history if it were run as given."""
+    pace = prescription.avg_pace_sec
+    if not math.isfinite(pace):
+        pace = easy_slow_sec
+    intensity = classify_intensity(pace, zones)
+    return {
+        "date": date,
+        "name": prescription.kind,
+        "type": "Run",
+        "distance_km": prescription.distance_km,
+        "moving_seconds": prescription.distance_km * pace,
+        "pace_sec_per_km": pace,
+        "intensity": intensity,
+        "load": session_load(prescription.distance_km, pace, easy_slow_sec),
+        "is_quality": is_quality_kind(prescription.kind) or intensity in ("hard", "moderate"),
+        "is_long_run": prescription.kind.startswith("Long run"),
+        "avg_hr": math.nan,
+        "session_type": "",
+    }
+
+
+def _volume_note(total: float, target: float, per_week: int) -> str:
+    """Whether the week as projected actually reaches its own volume target."""
+    if not math.isfinite(target) or target <= 0 or total <= 0:
+        return ""
+    gap = target - total
+    if abs(gap) <= target * 0.08:
+        return ""
+    if gap > 0:
+        return (f"This week lands about {gap:.0f} km short of its {target:.0f} km target. "
+                f"Across {per_week} running days that is roughly {gap / per_week:.1f} km more "
+                "per session — or one more running day, which is usually the easier change.")
+    return (f"This week runs about {-gap:.0f} km over its {target:.0f} km target. "
+            "Trim the easy days rather than the sessions if you want it back in line.")
+
+
+def week_ahead(runs: pd.DataFrame, zones: dict[str, float], easy_slow_sec: float,
+               goal: Goal, today: pd.Timestamp, days: int = 7,
+               week_index: int = 0) -> WeekOutlook:
+    """Project the next `days` days by asking the engine once per day."""
+    sim = runs.copy()
+    planned: list[PlannedDay] = []
+    scheduled = 0
+    rests_taken = 0
+    per_week = max(1, min(7, int(goal.days_per_week)))
+    rest_budget = max(0, days - per_week)
+
+    for offset in range(days):
+        day = pd.Timestamp(today) + pd.Timedelta(days=offset)
+        weeks_out = ((pd.Timestamp(goal.race_date) - day).days / 7.0
+                     if goal.race_date is not None else None)
+        phase = phase_for(weeks_out, goal.distance_m)
+        context = recent_context(sim, as_of=day)
+        load = acwr(sim, as_of=day)
+        target_km, _ = weekly_volume_target(context, phase, goal,
+                                            week_index=week_index + offset // 7)
+
+        # Place the rest days where a coach would: after the hard ones. An even
+        # spread ignores what the previous day actually was, and a day off after
+        # a threshold session is worth more than a day off after an easy 8 km.
+        runs_left = per_week - scheduled
+        rests_left = rest_budget - rests_taken
+        after_hard = bool(planned) and planned[-1].prescription is not None and (
+            is_quality_kind(planned[-1].prescription.kind)
+            or planned[-1].prescription.kind.startswith("Long run"))
+
+        if runs_left <= 0:
+            reason = (f"Rest — that is {per_week} running days, which is what you set. "
+                      "The days off are what let the sessions do their work.")
+        elif rests_left > 0 and after_hard:
+            reason = (f"Rest after {planned[-1].prescription.kind.lower()}. Adaptation happens "
+                      "in the recovery, not the session.")
+        else:
+            reason = ""
+
+        if reason:
+            rests_taken += 1
+            planned.append(PlannedDay(day, None, reason, phase.name, load.ratio))
+            continue
+
+        prescription = next_session(context, load, zones, easy_slow_sec,
+                                    phase, goal, target_km)
+
+        # The engine can veto a scheduled running day. Honour that, and do not
+        # spend one of the week's running days on it.
+        if prescription.kind.startswith("Rest"):
+            rests_taken += 1
+            planned.append(PlannedDay(day, None, prescription.rationale,
+                                      phase.name, load.ratio))
+            continue
+
+        planned.append(PlannedDay(day, prescription, "", phase.name, load.ratio))
+        scheduled += 1
+        sim = pd.concat(
+            [sim, pd.DataFrame([_synthetic_run(day, prescription, zones, easy_slow_sec)])],
+            ignore_index=True)
+
+    ran = [d for d in planned if not d.is_rest]
+    total = sum(d.distance_km for d in ran)
+    # Easy share from the sessions' structure, not their average pace: a
+    # threshold session is 4 km easy and 6 km of reps, and counting the whole
+    # thing as either one misrepresents the week against the 80/20 target.
+    easy_km = sum(d.distance_km - (d.prescription.hard_km if d.prescription else 0.0)
+                  for d in ran)
+    final_context = recent_context(sim, as_of=pd.Timestamp(today) + pd.Timedelta(days=days - 1))
+    final_phase = phase_for(((pd.Timestamp(goal.race_date) - pd.Timestamp(today)).days / 7.0
+                             if goal.race_date is not None else None), goal.distance_m)
+    target_km, _ = weekly_volume_target(final_context, final_phase, goal, week_index=week_index)
+
+    return WeekOutlook(
+        days=planned,
+        total_km=total,
+        quality_sessions=sum(1 for d in ran
+                             if d.prescription is not None
+                             and is_quality_kind(d.prescription.kind)),
+        longest_km=max((d.distance_km for d in ran), default=0.0),
+        easy_share=(easy_km / total) if total > 0 else math.nan,
+        target_km=target_km,
+        end_ratio=acwr(sim, as_of=pd.Timestamp(today) + pd.Timedelta(days=days - 1)).ratio,
+        shortfall=_volume_note(total, target_km, per_week),
+        caveat=("A projection, not a schedule. Every day assumes the one before it was run "
+                "exactly as prescribed. Run something different — or nothing — and the rest "
+                "of the week is recalculated from what actually happened."),
     )

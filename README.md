@@ -17,7 +17,8 @@ target time — saved to a Google Sheet you own.
 | Tab | What you get |
 |---|---|
 | **Next session** | The prescribed run — type, distance, structure, target pace — plus the signals that triggered it, this week's volume target, and your acute:chronic load trend |
-| **Add a run** | Drop in a screenshot of a Strava summary; it reads the numbers, shows you what it read, and adds the run only once you have confirmed or corrected it |
+| **Week ahead** | The next seven days projected out — session, distance and structure for each, rest days placed after the hard ones, plus projected volume, quality count and easy share against target |
+| **Add a run** | Drop in a screenshot of a Strava summary; it reads the numbers, shows you what it read, and adds the run only once you have confirmed or corrected it — including what kind of session it was |
 | **Fitness & paces** | Your five training paces from a single recent effort, equivalent race times at current fitness, and every run plotted against your pace zones |
 | **Goal check** | Current fitness against what the goal requires, whether the timeline covers the gap, and where your volume sits against what that time usually takes |
 | **Training history** | Weekly volume, easy share, longest run and load; every run with its classification; CSV export |
@@ -51,6 +52,19 @@ have. On the test data an 8-week window versus a 4-week one is 1.7 VDOT points �
 seven minutes of predicted marathon. If a saved effort falls outside the window,
 the app says so rather than quietly carrying on.
 
+**What the session was.** Each run carries a session type — Easy, Long run,
+Threshold, Intervals, Race and so on — set from a dropdown when you add the run,
+and defaulting to a guess from its name, distance and pace. The label overrides
+the inference in both directions: an 8 km in 44:00 averages 5:30/km and reads as
+easy, but labelled *Intervals* it counts as quality and blocks a second hard
+session for three days; a brisk 6 km labelled *Recovery run* stays easy however
+fast it was. `Long run` and `Recovery run` likewise override the
+distance-based long-run rule.
+
+Leaving the dropdown on *Auto* reproduces the old behaviour exactly, and a
+history saved before the column existed loads unchanged, so nothing has to be
+relabelled.
+
 **Load → acute:chronic ratio.** Each run scores intensity-weighted kilometres,
 `distance × (easy pace ÷ session pace)²`, so an easy kilometre scores 1.0 and
 faster running scores more. The last 7 days are compared against the last 28
@@ -82,6 +96,22 @@ not the same athlete.
 whether quality work means threshold reps, VO2max intervals, or race-pace
 segments inside the long run.
 
+**The week ahead.** `week_ahead` projects seven days by running the decision
+tree once per day, writing each prescription into a copy of the run history as
+though it had been run as given, and deciding the next day from the updated
+history. Reusing the real context and load functions rather than approximating
+them is the point: a parallel projection drifts out of step with the engine it
+is meant to preview.
+
+Building it surfaced two bugs in the engine, which is the usual argument for
+simulating a system against itself. A quality session's *average* pace includes
+its warm-up and jog recoveries, so a 10 km threshold session read as "easy" and
+never reset `days_since_quality` — the projection cheerfully prescribed
+threshold four days running. And the long run sits above the quality check in
+the tree, so a long run with race-pace segments was being prescribed two days
+after a threshold session without anything objecting. Both are fixed, and both
+are now tested.
+
 **The decision tree,** in priority order:
 
 | Check | Prescription |
@@ -107,9 +137,10 @@ Worth reading before you trust any of it.
   more than anything in this repo, and none of them are in a Strava export.
 - **It only sees averages.** The bulk export gives one average pace per activity,
   not splits. An interval session shows up at its average pace — which includes
-  the jog recoveries — and so looks easier than it was. The classifier reads
-  activity names to compensate; that is a patch, not a fix. Wire up the API's lap
-  data if you want it exact.
+  the jog recoveries — and so looks easier than it was. Two things compensate:
+  the classifier reads activity names, and every run you add by hand carries a
+  **session type** you pick from a dropdown, which overrides the inference
+  outright. Neither is as good as lap data; wire up the API if you want it exact.
 - **The ACWR is contested.** It is widely used and widely criticised — the
   original injury-risk findings have not replicated cleanly, and the arithmetic
   is sensitive to how load is defined. It is here as a spike detector, which is

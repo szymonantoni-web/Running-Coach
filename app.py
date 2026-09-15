@@ -34,12 +34,23 @@ from plan import (
     Goal,
     assess_goal,
     next_session,
+    is_quality_kind,
     phase_for,
     race_profile,
+    week_ahead,
     weekly_volume_target,
 )
 from strava import append_runs, best_efforts, load_activities
-from training_load import acwr, add_derived, recent_context, weekly_summary
+from training_load import (
+    AUTO_SESSION,
+    SESSION_TYPES,
+    acwr,
+    add_derived,
+    recent_context,
+    session_type,
+    suggest_session_type,
+    weekly_summary,
+)
 
 st.set_page_config(page_title="Strava Coach", page_icon="🏃", layout="wide",
                    initial_sidebar_state="expanded")
@@ -446,8 +457,8 @@ kpi[4].metric("Easy share (28 d)",
               f"{(context.easy_share_28 - 0.80) * 100:+.0f} pp vs 80% target"
               if math.isfinite(context.easy_share_28) else None)
 
-next_tab, add_tab, fitness_tab, goal_tab, history_tab, method_tab = st.tabs(
-    ["Next session", "Add a run", "Fitness & paces", "Goal check",
+next_tab, week_tab, add_tab, fitness_tab, goal_tab, history_tab, method_tab = st.tabs(
+    ["Next session", "Week ahead", "Add a run", "Fitness & paces", "Goal check",
      "Training history", "How it decides"]
 )
 
@@ -557,20 +568,53 @@ def _run_form(parsed: "ocr.ParsedRun | None", fingerprint: str | None) -> None:
 
     seconds = parse_duration(time_text)
     valid = math.isfinite(seconds) and seconds > 0 and distance_km > 0
+    pace = seconds / distance_km if valid else math.nan
+
+    # -- what kind of session was it ---------------------------------------
+    labels = list(SESSION_TYPES)
+    suggested = suggest_session_type(run_name, distance_km, pace, zones)
+    chosen_label = st.selectbox(
+        "Type of session", labels,
+        index=labels.index(suggested) if suggested in labels else 0,
+        key="add_type",
+        help="What the run actually was. This overrides what the average pace suggests, "
+             "which is the whole point: an interval session's average includes the jog "
+             "recoveries and reads as easy.",
+    )
+    chosen = session_type(chosen_label)
+    if chosen.note:
+        st.caption(chosen.note)
 
     if not valid:
         st.error("That time could not be read — try 1:06:52 or 50:00.")
-    else:
-        pace = seconds / distance_km
-        if 120 <= pace <= 900:
-            band = ("easy" if pace >= zones["marathon"] * 1.03
+    elif 120 <= pace <= 900:
+        measured = ("easy" if pace >= zones["marathon"] * 1.03
                     else "hard" if pace <= zones["threshold"] * 1.02 else "moderate")
-            st.markdown(f"**Pace: {format_pace(pace)}** — this counts as a **{band}** run "
-                        "at your current fitness")
-        else:
-            st.markdown(f"**Pace: {format_pace(pace)}**")
-            st.error("That distance and time give an implausible pace. One of the two is wrong.")
-            valid = False
+        recorded = measured
+        if chosen.intensity is not None:
+            recorded = chosen.intensity
+        elif chosen.intensity_floor is not None and \
+                {"easy": 0, "moderate": 1, "hard": 2}[measured] < \
+                {"easy": 0, "moderate": 1, "hard": 2}[chosen.intensity_floor]:
+            recorded = chosen.intensity_floor
+
+        line = f"**Pace: {format_pace(pace)}** — the average alone reads as **{measured}**"
+        if recorded != measured:
+            line += f", but a {chosen_label.lower()} is recorded as **{recorded}**"
+        flags = []
+        if chosen.quality is True:
+            flags.append("counts as quality (no second hard session for three days)")
+        elif chosen.quality is False:
+            flags.append("not quality")
+        if chosen.long_run is True:
+            flags.append("resets the long-run clock")
+        elif chosen.long_run is False:
+            flags.append("never the long run")
+        st.markdown(line + ("  \n" + " · ".join(flags).capitalize() + "." if flags else ""))
+    else:
+        st.markdown(f"**Pace: {format_pace(pace)}**")
+        st.error("That distance and time give an implausible pace. One of the two is wrong.")
+        valid = False
 
     if parsed is not None:
         with st.expander("What the OCR actually saw"):
@@ -584,11 +628,81 @@ def _run_form(parsed: "ocr.ParsedRun | None", fingerprint: str | None) -> None:
             "moving_seconds": float(seconds),
             "avg_hr": float(avg_hr) if avg_hr else None,
             "elevation_m": float(elevation) if elevation else None,
+            "session_type": "" if chosen is AUTO_SESSION else chosen_label,
         }
         save_runs(append_runs(runs, [entry]))
         if fingerprint:
             st.session_state["processed_shots"].append(fingerprint)
         _rerun_now()
+
+
+# --------------------------------------------------------------------------
+# Week ahead
+# --------------------------------------------------------------------------
+
+with week_tab:
+    st.subheader("The next seven days")
+    outlook = week_ahead(runs, zones, easy_slow, goal, today, days=7, week_index=week_index)
+
+    top = st.columns(4)
+    top[0].metric("Projected volume", f"{outlook.total_km:.0f} km",
+                  f"{outlook.total_km - outlook.target_km:+.0f} km vs target"
+                  if math.isfinite(outlook.target_km) else None,
+                  delta_color="off")
+    top[1].metric("Quality sessions", f"{outlook.quality_sessions}")
+    top[2].metric("Longest run", f"{outlook.longest_km:.0f} km")
+    top[3].metric("Easy share", f"{outlook.easy_share * 100:.0f}%"
+                  if math.isfinite(outlook.easy_share) else "—",
+                  f"{(outlook.easy_share - 0.80) * 100:+.0f} pp vs 80% target"
+                  if math.isfinite(outlook.easy_share) else None)
+
+    if outlook.shortfall:
+        st.warning(outlook.shortfall)
+
+    st.caption(f"↔ {outlook.caveat}")
+    st.divider()
+
+    for index, day in enumerate(outlook.days):
+        label = f"**{day.date:%A %d %b}**" + ("  ·  today" if index == 0 else "")
+        columns = st.columns([2, 5])
+        with columns[0]:
+            st.markdown(label)
+            st.caption(f"{day.phase_name} phase"
+                       + (f"  ·  load {day.load_ratio:.2f}×" if math.isfinite(day.load_ratio) else ""))
+        with columns[1]:
+            if day.is_rest:
+                st.markdown("🛌 **Rest**")
+                st.caption(day.rest_reason)
+            else:
+                mark = "🔴" if is_quality_kind(day.prescription.kind) else (
+                    "🟠" if day.prescription.kind.startswith("Long run") else "🟢")
+                st.markdown(f"{mark} **{day.prescription.kind} — "
+                            f"{day.prescription.distance_km:.1f} km**")
+                st.caption(day.prescription.structure)
+                st.caption(f"Target pace: {day.prescription.target_pace}")
+        if index < len(outlook.days) - 1:
+            st.divider()
+
+    st.divider()
+    st.markdown("**Why this is a projection and not a plan**")
+    st.markdown(
+        """
+Each day is produced by asking the same engine that fills the Next session tab,
+then writing that session into a copy of your history as though you had run it
+exactly as prescribed, and asking again from the new history. So Thursday's
+answer depends on Monday's having happened.
+
+That makes the later days progressively less trustworthy. Tomorrow is a genuine
+recommendation; Saturday is a sketch of what the week is shaped like if nothing
+changes. Run something different, run nothing, or add a run from a screenshot,
+and the whole week is recalculated from what actually happened — which is the
+advantage of a rules engine over a printed twelve-week plan, and the reason not
+to treat this table as one.
+
+The rest days are placed after hard sessions rather than spread evenly, and the
+number of them comes from the **running days per week** slider in the sidebar.
+        """
+    )
 
 
 with add_tab:
@@ -664,12 +778,13 @@ with add_tab:
     st.markdown("**Most recent runs in this profile**")
     recent = runs.sort_values("date", ascending=False).head(8)
     for position, (_, row) in enumerate(recent.iterrows()):
-        columns = st.columns([3, 2, 2, 2, 1])
-        columns[0].write(str(row["name"])[:34])
+        columns = st.columns([3, 2, 2, 2, 2, 1])
+        columns[0].write(str(row["name"])[:30])
         columns[1].write(pd.Timestamp(row["date"]).strftime("%a %d %b"))
         columns[2].write(f"{row['distance_km']:.2f} km")
         columns[3].write(format_pace(row["pace_sec_per_km"]))
-        if columns[4].button("✕", key=f"remove_{position}",
+        columns[4].caption(str(row.get("session_type") or "auto"))
+        if columns[5].button("✕", key=f"remove_{position}",
                              help="Delete this run from the profile"):
             keep = runs.drop(index=row.name)
             save_runs(keep)
@@ -817,8 +932,9 @@ with history_tab:
     detail["Pace"] = detail["pace_sec_per_km"].map(format_pace)
     detail["Time"] = detail["moving_seconds"].map(format_duration)
     detail["Intensity"] = detail["intensity"].str.capitalize()
+    detail["Type"] = detail.get("session_type", pd.Series("", index=detail.index)).replace("", "auto")
     show_table(
-        detail[["Date", "name", "distance_km", "Time", "Pace", "Intensity", "avg_hr"]]
+        detail[["Date", "name", "distance_km", "Time", "Pace", "Type", "Intensity", "avg_hr"]]
         .rename(columns={"name": "Run", "distance_km": "km", "avg_hr": "avg HR"})
         .sort_values("Date", ascending=False, key=lambda s: pd.to_datetime(s, format="%a %d %b %Y"))
         .round(2),
@@ -840,6 +956,14 @@ with method_tab:
     st.subheader("How the coach decides")
     st.markdown(
         """
+**0. What the session was.** Every run carries a type — chosen from the dropdown
+when you add it, or inferred from pace and name when you leave it on *Auto*. The
+label wins over the inference, because the export only ever gives one average
+pace per activity and that average is wrong in a predictable direction: an
+interval session's includes the jog recoveries, so a hard session reads as easy
+and never resets the quality clock. Telling the app what you ran is the cheapest
+fix there is.
+
 **1. Fitness → VDOT.** One recent hard effort goes through the Daniels–Gilbert
 equations to produce a VDOT, an "effective VO2max" inferred from performance.
 Every training pace and race prediction comes from that single number.
@@ -876,6 +1000,13 @@ less accumulated fatigue to shed than after eighteen weeks of marathon volume.
 Every threshold in that table is a named constant at the top of `plan.py`.
 They are conventions, not constants of nature — change them if your coach,
 your body or your evidence says otherwise.
+
+**5. The week ahead** runs that same tree seven times. Each day's prescription
+is written into a copy of your history as though it had been run exactly as
+given, and the next day is decided from the updated history. Rest days are
+placed after hard sessions, and how many there are comes from the running-days
+slider. It is a projection, not a schedule — the further out a day is, the more
+assumptions stand between it and reality.
         """
     )
 

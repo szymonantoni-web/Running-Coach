@@ -25,6 +25,106 @@ QUALITY_WORDS = (
 LONG_RUN_MIN_KM = 15.0          # below this it is a normal run, not a long run
 LONG_RUN_SHARE = 0.28           # or ≥28% of the week's volume
 
+INTENSITY_ORDER = {"easy": 0, "moderate": 1, "hard": 2, "unknown": -1}
+
+
+@dataclass(frozen=True)
+class SessionType:
+    """What the runner says a session was, overriding what its average says.
+
+    The export gives one average pace per activity, and that average is the
+    root of most of the misclassification here: an interval session's average
+    includes the jog recoveries, so a genuinely hard session reads as easy and
+    stops counting as quality. Telling the app what the session was is the
+    cheapest possible fix for that, and it beats every heuristic.
+
+    `intensity` pins the classification outright — used where the label is more
+    reliable than the pace, as with a recovery run taken briskly on a downhill.
+    `intensity_floor` only raises it — an interval session is at least moderate,
+    but if the average pace says hard, hard stands.
+    """
+    label: str
+    quality: bool | None = None         # None: decide from pace and name
+    long_run: bool | None = None        # None: decide from distance
+    intensity: str | None = None        # exact override
+    intensity_floor: str | None = None  # raise to at least this
+    note: str = ""
+
+
+AUTO_SESSION = SessionType("Auto — work it out from the data", note=(
+    "Pace and the activity name decide. Fine for easy running; unreliable for "
+    "anything with recoveries in it."))
+
+SESSION_TYPES: dict[str, SessionType] = {
+    t.label: t for t in [
+        AUTO_SESSION,
+        SessionType("Easy run", quality=False, intensity="easy",
+                    note="Counts toward the easy 80%. Still flagged as the long run if it is "
+                         "the week's longest."),
+        SessionType("Recovery run", quality=False, long_run=False, intensity="easy",
+                    note="Never the long run and never quality, whatever the pace says."),
+        SessionType("Long run", quality=False, long_run=True,
+                    note="Resets the long-run clock, so the coach stops asking for one."),
+        SessionType("Long run with quality", quality=True, long_run=True,
+                    intensity_floor="moderate",
+                    note="Race-pace or tempo segments inside a long run — both clocks reset."),
+        SessionType("Threshold / tempo", quality=True, long_run=False,
+                    intensity_floor="moderate",
+                    note="Resets the quality clock; no second hard session for three days."),
+        SessionType("Intervals", quality=True, long_run=False, intensity_floor="moderate",
+                    note="The one the average pace gets most wrong — the jog recoveries drag "
+                         "it into the easy band."),
+        SessionType("Fartlek", quality=True, long_run=False, intensity_floor="moderate"),
+        SessionType("Hill session", quality=True, long_run=False, intensity_floor="moderate"),
+        SessionType("Progression run", quality=True, intensity_floor="moderate"),
+        SessionType("Race / time trial", quality=True, intensity_floor="hard",
+                    note="Also makes the run a candidate for your fitness benchmark."),
+    ]
+}
+
+
+def session_type(label: str | None) -> SessionType:
+    """The named type, or the auto rule for anything unrecognised."""
+    return SESSION_TYPES.get(str(label or "").strip(), AUTO_SESSION)
+
+
+def suggest_session_type(name: str, distance_km: float, pace_sec: float,
+                         zones: dict[str, float]) -> str:
+    """A first guess at what a run was, for pre-selecting the dropdown.
+
+    A suggestion, never a decision — it is wrong in exactly the cases the
+    dropdown exists for. The name is trusted over the pace, because a session
+    named "5x1k" is a session whatever its average says.
+    """
+    text = str(name or "").lower()
+    for words, label in (
+        (("interval", "track", "repeat", "vo2", " x ", "×"), "Intervals"),
+        (("tempo", "threshold"), "Threshold / tempo"),
+        (("fartlek",), "Fartlek"),
+        (("hill",), "Hill session"),
+        (("race", "parkrun", "time trial", "tt"), "Race / time trial"),
+        (("progression",), "Progression run"),
+        (("long",), "Long run"),
+        (("recovery", "shakeout"), "Recovery run"),
+    ):
+        if any(word in text for word in words):
+            return label
+
+    if math.isfinite(distance_km) and distance_km >= LONG_RUN_MIN_KM:
+        return "Long run"
+    if classify_intensity(pace_sec, zones) == "easy":
+        return "Easy run"
+    return AUTO_SESSION.label
+
+
+def _apply_intensity_rule(rule: SessionType, measured: str) -> str:
+    if rule.intensity is not None:
+        return rule.intensity
+    if rule.intensity_floor is not None and \
+            INTENSITY_ORDER.get(measured, -1) < INTENSITY_ORDER[rule.intensity_floor]:
+        return rule.intensity_floor
+    return measured
+
 
 def classify_intensity(pace_sec: float, zones: dict[str, float]) -> str:
     """easy / moderate / hard, from average pace against the athlete's zones.
@@ -62,15 +162,27 @@ def session_load(distance_km: float, pace_sec: float, easy_pace_sec: float) -> f
 
 
 def add_derived(runs: pd.DataFrame, zones: dict[str, float], easy_pace_sec: float) -> pd.DataFrame:
-    """Attach intensity, load, quality and long-run flags to each run."""
+    """Attach intensity, load, quality and long-run flags to each run.
+
+    A run carrying a `session_type` the runner chose is classified by that
+    label; everything else falls back to pace and name.
+    """
     out = runs.copy()
-    out["intensity"] = out["pace_sec_per_km"].map(lambda p: classify_intensity(p, zones))
+    if "session_type" not in out.columns:
+        out["session_type"] = ""
+    rules = [session_type(label) for label in out["session_type"]]
+
+    measured = [classify_intensity(p, zones) for p in out["pace_sec_per_km"]]
+    out["intensity"] = [_apply_intensity_rule(rule, value)
+                        for rule, value in zip(rules, measured)]
     out["load"] = [session_load(km, pace, easy_pace_sec)
                    for km, pace in zip(out["distance_km"], out["pace_sec_per_km"])]
 
     names = out["name"].astype(str).str.lower()
     named_quality = names.apply(lambda n: any(word in n for word in QUALITY_WORDS))
-    out["is_quality"] = named_quality | out["intensity"].isin(["hard", "moderate"])
+    inferred_quality = named_quality | out["intensity"].isin(["hard", "moderate"])
+    out["is_quality"] = [rule.quality if rule.quality is not None else bool(value)
+                         for rule, value in zip(rules, inferred_quality)]
 
     week_totals = out.groupby(out["date"].dt.to_period("W"))["distance_km"].transform("sum")
     out["is_long_run"] = (out["distance_km"] >= LONG_RUN_MIN_KM) | \
@@ -78,6 +190,8 @@ def add_derived(runs: pd.DataFrame, zones: dict[str, float], easy_pace_sec: floa
     # A long run is the week's longest, not merely a long-ish one.
     week_max = out.groupby(out["date"].dt.to_period("W"))["distance_km"].transform("max")
     out["is_long_run"] &= out["distance_km"] >= week_max * 0.95
+    out["is_long_run"] = [rule.long_run if rule.long_run is not None else bool(value)
+                          for rule, value in zip(rules, out["is_long_run"])]
     return out
 
 

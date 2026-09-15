@@ -38,14 +38,19 @@ from plan import (  # noqa: E402
     ACWR_STOP,
     Goal,
     assess_goal,
+    is_quality_kind,
     next_session,
     phase_for,
     typical_peak_volume,
+    week_ahead,
     weekly_volume_target,
 )
 from strava import load_activities  # noqa: E402
 from training_load import (  # noqa: E402
+    AUTO_SESSION,
     LoadState,
+    SESSION_TYPES,
+    suggest_session_type,
     acwr,
     add_derived,
     classify_intensity,
@@ -538,6 +543,172 @@ def test_end_to_end_on_the_demo_data():
 
 
 # --------------------------------------------------------------------------
+
+
+
+# --------------------------------------------------------------------------
+# The week ahead
+# --------------------------------------------------------------------------
+
+def _week(days_per_week=5, distance_m=MARATHON_M, goal_seconds=3.5 * 3600, days=7):
+    runs = demo_runs()
+    today = runs["date"].max()
+    goal = Goal(distance_m=distance_m, goal_seconds=goal_seconds,
+                race_date=today + pd.Timedelta(weeks=14), days_per_week=days_per_week)
+    return week_ahead(runs, pace_zones(43.5), easy_pace_range(43.5)[1], goal, today, days=days)
+
+
+def test_week_ahead_returns_one_entry_per_day():
+    outlook = _week()
+    assert len(outlook.days) == 7
+    dates = [day.date for day in outlook.days]
+    assert dates == sorted(dates)
+    assert (dates[-1] - dates[0]).days == 6
+
+
+def test_week_ahead_respects_running_days_per_week():
+    for days_per_week in (3, 4, 5, 6):
+        outlook = _week(days_per_week=days_per_week)
+        ran = [day for day in outlook.days if not day.is_rest]
+        # The engine may veto a scheduled day (a forced rest), so it can run
+        # fewer — but never more than asked for.
+        assert len(ran) <= days_per_week, (days_per_week, len(ran))
+
+
+def test_week_ahead_never_stacks_quality_sessions():
+    """The bug this projection was built to expose: prescribing threshold on
+    consecutive days because a hard session's *average* pace reads as easy."""
+    outlook = _week(days_per_week=6)
+    quality_days = [index for index, day in enumerate(outlook.days)
+                    if not day.is_rest and is_quality_kind(day.prescription.kind)]
+    gaps = [b - a for a, b in zip(quality_days, quality_days[1:])]
+    assert all(gap >= 3 for gap in gaps), (quality_days, gaps)
+
+
+def test_week_ahead_totals_match_its_days():
+    outlook = _week()
+    assert abs(outlook.total_km - sum(day.distance_km for day in outlook.days)) < 1e-6
+    assert outlook.longest_km == max(day.distance_km for day in outlook.days)
+
+
+def test_hard_kilometres_are_a_minority_of_a_quality_session():
+    """A threshold session is mostly easy running by distance. Counting the
+    whole session as hard made the projected easy share meaningless."""
+    context = _context(days_since_quality=6.0, days_since_long=1.0)
+    session = next_session(context, _load(1.0), ZONES, EASY_SLOW,
+                           phase_for(30, MARATHON_M), GOAL, 50.0)
+    assert is_quality_kind(session.kind)
+    assert 0 < session.hard_km < session.distance_km
+    # And its average pace sits between the reps and easy running.
+    assert ZONES["threshold"] < session.avg_pace_sec < EASY_SLOW
+
+
+def test_week_ahead_easy_share_is_plausible():
+    outlook = _week(days_per_week=5)
+    assert 0.5 < outlook.easy_share <= 1.0, outlook.easy_share
+
+
+def test_short_race_week_differs_from_marathon_week():
+    marathon = _week(distance_m=MARATHON_M, goal_seconds=3.5 * 3600)
+    five_k = _week(distance_m=5000, goal_seconds=21 * 60)
+    assert marathon.longest_km > five_k.longest_km
+
+
+
+# --------------------------------------------------------------------------
+# Session types the runner chooses
+# --------------------------------------------------------------------------
+
+def _one_run(distance_km, seconds, name="Run", session="", when="2026-09-01"):
+    frame = pd.DataFrame([{
+        "date": pd.Timestamp(when), "name": name, "type": "Run",
+        "distance_km": distance_km, "moving_seconds": seconds,
+        "elevation_m": None, "avg_hr": None, "max_hr": None,
+        "session_type": session,
+    }])
+    frame["pace_sec_per_km"] = frame["moving_seconds"] / frame["distance_km"]
+    return add_derived(frame, pace_zones(50), easy_pace_range(50)[1])
+
+
+def test_interval_session_counts_as_quality_despite_an_easy_average():
+    """The reason the dropdown exists. 8 km in 44:00 is 5:30/km — squarely
+    easy at VDOT 50 — but the session was 5 x 1 km with jog recoveries."""
+    auto = _one_run(8.0, 44 * 60, name="Evening Run")
+    assert auto["intensity"].iloc[0] == "easy"
+    assert not bool(auto["is_quality"].iloc[0])
+
+    labelled = _one_run(8.0, 44 * 60, name="Evening Run", session="Intervals")
+    assert labelled["intensity"].iloc[0] == "moderate"     # floor applied
+    assert bool(labelled["is_quality"].iloc[0])
+
+
+def test_label_can_also_demote_a_run():
+    """A brisk recovery run is still a recovery run."""
+    auto = _one_run(6.0, 26 * 60, name="Morning Run")     # 4:20/km — hard
+    assert auto["intensity"].iloc[0] == "hard"
+    assert bool(auto["is_quality"].iloc[0])
+
+    labelled = _one_run(6.0, 26 * 60, name="Morning Run", session="Recovery run")
+    assert labelled["intensity"].iloc[0] == "easy"
+    assert not bool(labelled["is_quality"].iloc[0])
+    assert not bool(labelled["is_long_run"].iloc[0])
+
+
+def test_intensity_floor_does_not_lower_a_genuinely_hard_run():
+    """The floor raises; it never demotes. A 5 km race averaged at race pace
+    stays hard rather than being pulled down to moderate."""
+    run = _one_run(5.0, 19 * 60 + 57, name="Race", session="Race / time trial")
+    assert run["intensity"].iloc[0] == "hard"
+
+
+def test_long_run_label_overrides_the_distance_rule():
+    short = _one_run(9.0, 54 * 60, session="Long run")
+    assert bool(short["is_long_run"].iloc[0])
+    long_but_labelled = _one_run(22.0, 2 * 3600, session="Recovery run")
+    assert not bool(long_but_labelled["is_long_run"].iloc[0])
+
+
+def test_unlabelled_runs_behave_exactly_as_before():
+    """Adding the column must not change how an existing history is read."""
+    runs = demo_runs().drop(columns=["session_type"], errors="ignore")
+    zones, easy_slow = pace_zones(43.5), easy_pace_range(43.5)[1]
+    with_column = add_derived(runs.assign(session_type=""), zones, easy_slow)
+    without = add_derived(runs.drop(columns=["session_type"], errors="ignore"), zones, easy_slow)
+    for column in ("intensity", "is_quality", "is_long_run", "load"):
+        assert list(with_column[column]) == list(without[column]), column
+
+
+def test_suggestions_read_the_name_before_the_pace():
+    zones = pace_zones(50)
+    assert suggest_session_type("Track 5x1k", 8.0, 330, zones) == "Intervals"
+    assert suggest_session_type("Tempo", 10.0, 300, zones) == "Threshold / tempo"
+    assert suggest_session_type("Sunday long", 12.0, 340, zones) == "Long run"
+    assert suggest_session_type("Morning Run", 22.0, 340, zones) == "Long run"
+    assert suggest_session_type("Morning Run", 8.0, 340, zones) == "Easy run"
+    # Every suggestion must be selectable in the dropdown.
+    for name, distance, pace in [("Track 5x1k", 8.0, 330), ("Morning Run", 8.0, 250)]:
+        assert suggest_session_type(name, distance, pace, zones) in SESSION_TYPES
+
+
+def test_session_types_round_trip_through_storage():
+    import storage
+    runs = _one_run(8.0, 44 * 60, name="Evening Run", session="Intervals")
+    rows = storage.runs_to_rows("Szymon", runs)
+    back = storage.rows_to_runs([dict(zip(storage.RUN_COLUMNS, row)) for row in rows], "Szymon")
+    assert back["session_type"].iloc[0] == "Intervals"
+
+
+def test_a_sheet_written_before_the_column_existed_still_loads():
+    import storage
+    legacy = ["profile", "date", "name", "type", "distance_km", "moving_seconds",
+              "elevation_m", "avg_hr"]
+    row = dict(zip(legacy, ["Szymon", "2026-09-01T07:00:00", "Run", "Run",
+                            "10.000", "3000", "", ""]))
+    back = storage.rows_to_runs([row], "Szymon")
+    assert len(back) == 1
+    assert back["session_type"].iloc[0] == ""
+    assert AUTO_SESSION.label not in back["session_type"].iloc[0]
+
 
 if __name__ == "__main__":
     tests = [(name, obj) for name, obj in sorted(globals().items())
