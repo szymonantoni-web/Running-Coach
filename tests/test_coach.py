@@ -209,6 +209,46 @@ Activity Date,Activity Name,Activity Type,Distance,Elapsed Time,Moving Time
     assert close(runs["pace_sec_per_km"].iloc[0], 300.0, 1e-9)
 
 
+def test_best_efforts_respects_the_recency_window():
+    """A fast run from months ago must not be offered as *current* fitness —
+    it would propagate into every pace, prediction and goal verdict."""
+    from strava import best_efforts
+
+    runs = demo_runs()
+    latest = runs["date"].max()
+
+    recent = best_efforts(runs, within_days=56, as_of=latest)
+    assert not recent.empty
+    assert (recent["date"] >= latest - pd.Timedelta(days=56)).all()
+
+    # A wider window can only ever offer more candidates, never fewer.
+    assert len(best_efforts(runs, within_days=None)) >= len(recent)
+
+    # And it really is filtering: the demo spans ~20 weeks.
+    everything = best_efforts(runs, within_days=None)
+    assert everything["date"].min() < recent["date"].min()
+
+
+def test_best_efforts_returns_empty_rather_than_widening_silently():
+    """When nothing qualifies the caller must be able to tell, so it can say
+    so rather than quietly using a stale effort."""
+    from strava import best_efforts
+
+    runs = demo_runs()
+    far_future = runs["date"].max() + pd.Timedelta(days=400)
+    assert best_efforts(runs, within_days=56, as_of=far_future).empty
+
+
+def test_best_efforts_ranks_by_pace_within_the_window():
+    from strava import best_efforts
+
+    runs = demo_runs()
+    picked = best_efforts(runs, within_days=56, as_of=runs["date"].max(), limit=3)
+    window = runs[runs["date"] >= runs["date"].max() - pd.Timedelta(days=56)]
+    window = window[window["distance_km"] >= 3.0]
+    assert picked["pace_sec_per_km"].max() <= window["pace_sec_per_km"].nsmallest(3).max() + 1e-9
+
+
 def test_demo_file_loads():
     runs = load_activities(DEMO)
     assert len(runs) > 50

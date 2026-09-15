@@ -42,6 +42,15 @@ test suite checks the implementation against Daniels' published tables — a 19:
 5 km comes back as VDOT 50, which then predicts 41:21 for 10 km and 3:10:49 for
 the marathon, matching the book to within a few seconds.
 
+The effort is picked from a **recency window** — 8 weeks by default, adjustable in
+the sidebar — and the date it was run is saved with the profile. Both matter:
+ranking across a whole imported history surfaces the fastest run of the year, and
+a VDOT taken from a months-old effort then propagates into every training pace,
+every race prediction and the goal verdict, describing fitness you may no longer
+have. On the demo data an 8-week window versus a 4-week one is 1.7 VDOT points —
+seven minutes of predicted marathon. If a saved effort falls outside the window,
+the app says so rather than quietly carrying on.
+
 **Load → acute:chronic ratio.** Each run scores intensity-weighted kilometres,
 `distance × (easy pace ÷ session pace)²`, so an easy kilometre scores 1.0 and
 faster running scores more. The last 7 days are compared against the last 28
