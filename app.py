@@ -35,6 +35,7 @@ from plan import (
     assess_goal,
     next_session,
     phase_for,
+    race_profile,
     weekly_volume_target,
 )
 from strava import append_runs, best_efforts, load_activities
@@ -414,7 +415,8 @@ weekly = weekly_summary(runs)
 context = recent_context(runs, as_of=as_of)
 load = acwr(runs, as_of=as_of)
 weeks_out = (goal.race_date - today).days / 7.0
-phase = phase_for(weeks_out)
+phase = phase_for(weeks_out, goal.distance_m)
+racing = race_profile(goal.distance_m)
 week_index = max(0, (today - runs["date"].min()).days // 7)
 target_km, target_reason = weekly_volume_target(context, phase, goal, week_index=week_index)
 prescription = next_session(context, load, zones, easy_slow, phase, goal, target_km)
@@ -485,6 +487,12 @@ with next_tab:
                 else "**Weekly target unavailable**")
     st.caption(target_reason)
     st.caption(f"**{phase.name} phase** — {phase.description}")
+    st.caption(
+        f"Shaped for **{racing.label.lower()}**: long runs capped at "
+        f"{racing.long_run_cap_km:.0f} km, quality work built around "
+        f"{'intervals' if racing.emphasis == 'intervals' else 'threshold' if racing.emphasis == 'threshold' else 'threshold and intervals'}"
+        f" — {racing.why}."
+    )
 
     show_chart(charts.weekly_volume_chart(weekly, runs, target_km=target_km))
 
@@ -840,9 +848,19 @@ Every training pace and race prediction comes from that single number.
 `distance × (easy pace ÷ session pace)²`. The last 7 days are compared against the
 last 28 divided by four. Around 1.0 means this week looks like the recent norm.
 
-**3. Phase → what kind of session.** Weeks to race set the phase: base above 18
-weeks, build 18–8, peak 8–3, taper inside 3. The phase decides whether quality
-work means threshold, intervals or marathon-pace segments.
+**3. Race distance → the shape of the block.** The target distance, not just the
+target time, drives the coaching layer. It sets the phase boundaries, the volume
+band, the long-run cap and which session carries the block:
+
+| Race | Base / build / peak / taper | Long run cap | Emphasis |
+|---|---|---|---|
+| Marathon | >18 / 18–8 / 8–3 / <3 weeks | 34 km | Threshold + race-pace segments |
+| Half marathon | >14 / 14–6 / 6–2 / <2 | 26 km | Threshold + race-pace segments |
+| 10 km | >12 / 12–5 / 5–1.5 / <1.5 | 20 km | Threshold and intervals, alternating |
+| 5 km | >10 / 10–4 / 4–1 / <1 | 16 km | Intervals, threshold in support |
+
+A 5 km block sharpens later and tapers for about a week, because there is far
+less accumulated fatigue to shed than after eighteen weeks of marathon volume.
 
 **4. The decision tree, in priority order.**
 

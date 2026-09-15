@@ -41,15 +41,66 @@ LONG_RUN_MIN_GAP_DAYS = 6
 ACWR_CAUTION = 1.3
 ACWR_STOP = 1.5
 
-# Typical peak weekly volume for a marathon goal, km. Ranges, not requirements —
-# people have run every one of these times on less, and on far more.
-VOLUME_FOR_MARATHON_TIME = [
-    (3.00 * 3600, 80, 100),
-    (3.25 * 3600, 70, 85),
-    (3.50 * 3600, 60, 75),
-    (4.00 * 3600, 50, 65),
-    (float("inf"), 40, 55),
+# --------------------------------------------------------------------------
+# What the race distance changes
+#
+# Everything below this point used to be marathon-shaped: an 18/8/3-week
+# periodisation, 34 km long runs, threshold-and-marathon-pace emphasis, and a
+# volume table keyed off marathon finishing times. Applied to a 5 km goal that
+# is wrong in every particular — a 20-minute 5 km would have been read against
+# the sub-3-marathon volume band and told to run 80 km a week.
+#
+# The distance changes four things, so each is a field rather than a constant.
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RaceProfile:
+    label: str
+    min_distance_m: float
+    # Weeks-to-race boundaries: above base_from is base, then build, then peak,
+    # then taper. Shorter races sharpen later and taper for days, not weeks.
+    base_from: float
+    build_from: float
+    peak_from: float
+    long_run_cap_km: float          # no point running 34 km for a 5 km race
+    long_run_share: float           # of weekly volume
+    base_volume: tuple[float, float]  # typical peak weekly km at VDOT 45
+    race_pace_work: bool            # are race-pace segments in the long run useful?
+    emphasis: str                   # which quality session carries the block
+    why: str                        # one line, shown in the session rationale
+
+
+RACE_PROFILES = [
+    RaceProfile(
+        "Marathon", 30000, 18, 8, 3, 34.0, 0.30, (65, 90), True, "threshold",
+        "the marathon is decided by the pace you can hold before lactate accumulates, "
+        "and by how late in a long run you can still hold it",
+    ),
+    RaceProfile(
+        "Half marathon", 15000, 14, 6, 2, 26.0, 0.28, (55, 80), True, "threshold",
+        "the half sits almost exactly at threshold, so raising that pace raises the race",
+    ),
+    RaceProfile(
+        "10 km", 8000, 12, 5, 1.5, 20.0, 0.25, (45, 70), False, "mixed",
+        "10 km sits between threshold and VO2max, so the block needs both",
+    ),
+    RaceProfile(
+        "5 km", 3000, 10, 4, 1.0, 16.0, 0.25, (38, 58), False, "intervals",
+        "5 km is run close to VO2max, so interval work is the session that moves it",
+    ),
+    RaceProfile(
+        "Short", 0, 8, 3, 1.0, 12.0, 0.22, (30, 50), False, "intervals",
+        "short races are limited by speed and economy more than by aerobic ceiling",
+    ),
 ]
+
+
+def race_profile(distance_m: float) -> RaceProfile:
+    """The profile for a race of this distance."""
+    for profile in RACE_PROFILES:
+        if distance_m >= profile.min_distance_m:
+            return profile
+    return RACE_PROFILES[-1]
 
 
 # --------------------------------------------------------------------------
@@ -71,7 +122,7 @@ PHASES = {
                    "Volume keeps climbing while threshold work becomes the weekly staple, "
                    "with intervals to lift ceiling fitness. The long run grows."),
     "peak": Phase("Peak", "Race-specific work",
-                  "The long run carries marathon-pace segments and volume tops out. "
+                  "Sessions take on the race's own pace and volume tops out. "
                   "Sessions now rehearse the race rather than build general fitness."),
     "taper": Phase("Taper", "Absorb the work",
                    "Volume drops sharply, intensity is kept but shortened. You cannot "
@@ -81,15 +132,21 @@ PHASES = {
 }
 
 
-def phase_for(weeks_out: float | None) -> Phase:
-    """Which training phase a number of weeks before the race falls in."""
+def phase_for(weeks_out: float | None, distance_m: float = MARATHON_M) -> Phase:
+    """Which training phase a number of weeks before the race falls in.
+
+    The boundaries move with the distance. A marathon build is long and tapers
+    for three weeks; a 5 km block sharpens later and tapers for about one,
+    because there is far less accumulated fatigue to shed.
+    """
     if weeks_out is None or not math.isfinite(weeks_out):
         return PHASES["offseason"]
-    if weeks_out > 18:
+    profile = race_profile(distance_m)
+    if weeks_out > profile.base_from:
         return PHASES["base"]
-    if weeks_out > 8:
+    if weeks_out > profile.build_from:
         return PHASES["build"]
-    if weeks_out > 3:
+    if weeks_out > profile.peak_from:
         return PHASES["peak"]
     return PHASES["taper"]
 
@@ -142,11 +199,27 @@ def _vdot_gain_rate(vdot: float) -> float:
     return 0.10
 
 
-def typical_peak_volume(goal_seconds: float) -> tuple[float, float]:
-    for limit, low, high in VOLUME_FOR_MARATHON_TIME:
-        if goal_seconds <= limit:
-            return float(low), float(high)
-    return 40.0, 55.0
+def typical_peak_volume(distance_m: float, vdot: float) -> tuple[float, float]:
+    """Typical peak weekly kilometres for this race at this standard.
+
+    Two things drive it and both are needed. The **distance** sets the base —
+    marathoners run more than 5 km runners at the same standard. The **VDOT**
+    scales it, because faster runners of any distance run more. Keying off
+    finishing time alone, as this used to, is meaningless across distances: a
+    20-minute 5 km and a 20-minute 5 km split of a marathon are not remotely
+    the same training.
+
+    Ranges, not requirements. People have run every one of these times on less
+    and on far more; the number is here to show the gap, not to prescribe.
+    """
+    profile = race_profile(distance_m)
+    low, high = profile.base_volume
+    if not math.isfinite(vdot):
+        return float(low), float(high)
+    # Calibrated so a sub-3 marathon (VDOT ≈ 53.5) lands at the 80–100 km/week
+    # that is the conventional figure for that time.
+    return (max(20.0, low + (vdot - 45) * 1.8),
+            max(30.0, high + (vdot - 45) * 1.5))
 
 
 def assess_goal(vdot: float, goal: Goal, context: RecentContext,
@@ -167,7 +240,8 @@ def assess_goal(vdot: float, goal: Goal, context: RecentContext,
     reachable_seconds = predict_race_seconds(reachable, goal.distance_m) \
         if math.isfinite(reachable) else math.nan
 
-    low, high = typical_peak_volume(goal.goal_seconds)
+    racing = race_profile(goal.distance_m)
+    low, high = typical_peak_volume(goal.distance_m, required)
     weekly = context.last_28_km / 4.0 if math.isfinite(context.last_28_km) else math.nan
 
     notes: list[str] = []
@@ -176,22 +250,25 @@ def assess_goal(vdot: float, goal: Goal, context: RecentContext,
     if math.isfinite(weekly) and weekly > 0:
         if weekly < low * 0.7:
             notes.append(
-                f"You are averaging {weekly:.0f} km a week. Runners hitting this time "
-                f"usually peak around {low:.0f}–{high:.0f} km. That gap is the single "
-                "biggest thing standing between the two numbers."
+                f"You are averaging {weekly:.0f} km a week. Runners at this standard over "
+                f"{racing.label.lower()} usually peak around {low:.0f}–{high:.0f} km. "
+                "That gap is the single biggest thing standing between the two numbers."
             )
         elif weekly < low:
             notes.append(
                 f"At {weekly:.0f} km a week you are approaching, but not yet at, the "
-                f"{low:.0f}–{high:.0f} km range typical for this time."
+                f"{low:.0f}–{high:.0f} km typical at this standard over "
+                f"{racing.label.lower()}."
             )
 
     if goal.days_per_week and goal.days_per_week <= 4 and low >= 70:
+        longest = min(racing.long_run_cap_km, low * racing.long_run_share * 1.15)
         notes.append(
             f"On {goal.days_per_week} running days a week, {low:.0f} km means averaging "
-            f"{low / goal.days_per_week:.0f} km per run — long runs past 30 km and "
-            "midweek runs of 15–18 km. Worth deciding up front whether that fits your "
-            "week, or whether a fifth (shorter) day is the easier path."
+            f"{low / goal.days_per_week:.0f} km per run — long runs approaching "
+            f"{longest:.0f} km and midweek runs of {low / goal.days_per_week * 0.8:.0f} km. "
+            "Worth deciding up front whether that fits your week, or whether a fifth "
+            "(shorter) day is the easier path."
         )
 
     if math.isfinite(context.easy_share_28) and context.easy_share_28 < 0.7:
@@ -244,15 +321,25 @@ def weekly_volume_target(context: RecentContext, phase: Phase, goal: Goal,
     if not math.isfinite(base) or base <= 0:
         return math.nan, "Not enough history to set a weekly target yet."
 
-    low, high = typical_peak_volume(goal.goal_seconds)
+    racing = race_profile(goal.distance_m)
+    low, high = typical_peak_volume(goal.distance_m,
+                                    vdot_for_target(goal.distance_m, goal.goal_seconds))
     ceiling = high
 
     if phase.name == "Taper":
         weeks_out = max((pd.Timestamp(goal.race_date) - context.as_of).days / 7.0, 0) \
             if goal.race_date is not None else 0
-        factor = {0: 0.45, 1: 0.60, 2: 0.75}.get(int(weeks_out), 0.80)
-        return base * factor, (f"Taper week: about {factor * 100:.0f}% of recent volume. "
-                               "Intensity stays, distance goes.")
+        # A marathon taper sheds three weeks of accumulated fatigue; a 5 km
+        # taper is a few easy days. Cutting volume as hard for the short race
+        # would lose fitness rather than freshen you.
+        gentle = racing.peak_from <= 1.5
+        schedule = {0: 0.70, 1: 0.85} if gentle else {0: 0.45, 1: 0.60, 2: 0.75}
+        factor = schedule.get(int(weeks_out), 0.90 if gentle else 0.80)
+        return base * factor, (
+            f"Taper week for {racing.label.lower()}: about {factor * 100:.0f}% of recent "
+            "volume. Intensity stays, distance goes." +
+            ("" if gentle else " The long taper is what a marathon needs; a short race "
+                               "would want far less."))
 
     if week_index % 4 == 3:
         return base * DOWN_WEEK_FACTOR, ("Down week — every fourth week drops about 25% so "
@@ -260,8 +347,9 @@ def weekly_volume_target(context: RecentContext, phase: Phase, goal: Goal,
 
     target = min(base * MAX_WEEKLY_RAMP, ceiling)
     if target <= base * 1.01:
-        return base, (f"Holding at {base:.0f} km. You are at the top of the range typical "
-                      f"for this goal ({low:.0f}–{high:.0f} km), so consistency beats more volume.")
+        return base, (f"Holding at {base:.0f} km. That is the top of the range typical for "
+                      f"{racing.label.lower()} at this standard ({low:.0f}–{high:.0f} km), "
+                      "so consistency beats more volume.")
     return target, (f"Up about {(target / base - 1) * 100:.0f}% on your four-week average of "
                     f"{base:.0f} km — the conventional ceiling is 10% a week.")
 
@@ -300,6 +388,7 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
                  weekly_target_km: float) -> Prescription:
     """Decide the next run, in priority order: recover, then long, then
     quality, then easy."""
+    racing = race_profile(goal.distance_m)
     easy_window = f"{format_pace(zones['easy'])} – {format_pace(easy_slow_sec)}"
     remaining = weekly_target_km - context.last_7_km if math.isfinite(weekly_target_km) else math.nan
 
@@ -344,23 +433,32 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
     # 3. The long run is the week's anchor.
     if context.days_since_long >= LONG_RUN_MIN_GAP_DAYS:
         longest = context.longest_recent_km if math.isfinite(context.longest_recent_km) else 14.0
-        target = min(longest + 2.0, max(longest, 14.0))
+        # The cap is the race's, not the marathon's: 34 km serves a marathon and
+        # is pointless — and costly — in a 5 km block.
+        cap = racing.long_run_cap_km
+        target = min(longest + 2.0, max(longest, 10.0), cap)
         if phase.name == "Taper":
-            target = min(target * 0.7, 22.0)
+            target = min(target * (0.85 if racing.peak_from <= 1.5 else 0.7), cap)
         elif phase.name == "Peak":
-            target = min(longest + 2.0, 34.0)
+            target = min(longest + 2.0, cap)
 
-        if phase.name in ("Peak", "Build") and goal.distance_m >= 30000:
-            marathon_pace = zones["marathon"]
+        if phase.name in ("Peak", "Build") and racing.race_pace_work:
+            # Goal pace is simply the target time over the target distance — no model
+            # needed. Fall back to the VDOT marathon zone if no goal time is set.
+            race_pace = (goal.goal_seconds / (goal.distance_m / 1000.0)
+                         if goal.goal_seconds and math.isfinite(goal.goal_seconds)
+                         else zones["marathon"])
             segment = 6.0 if phase.name == "Peak" else 4.0
+            segment = min(segment, max(2.0, target * 0.25))
             return Prescription(
-                "Long run with marathon-pace work", round(target, 1),
-                f"{target - 2 * segment - 2:.0f} km easy → 2 × {segment:.0f} km at marathon pace "
-                f"({format_pace(marathon_pace)}) with 2 km easy between → 2 km easy.",
-                f"Easy {easy_window}; segments {_pace_window(marathon_pace)}",
+                f"Long run with {racing.label.lower()}-pace work", round(target, 1),
+                f"{target - 2 * segment - 2:.0f} km easy → 2 × {segment:.0f} km at "
+                f"{racing.label.lower()} pace ({format_pace(race_pace)}) with 2 km easy "
+                "between → 2 km easy.",
+                f"Easy {easy_window}; segments {_pace_window(race_pace)}",
                 f"Longest run in {_days(context.days_since_long)} days, and the {phase.name.lower()} phase "
-                "is where the long run stops being just time on feet. Marathon-pace segments late in a "
-                "long run rehearse the thing that actually decides the race: holding form and pace when "
+                "is where the long run stops being just time on feet. Race-pace segments late in a "
+                "long run rehearse the thing that actually decides the day: holding form and pace when "
                 "you are already tired.",
                 alternatives=[f"If you are flat, drop the segments and run all {target:.0f} km easy — "
                               "the distance is worth more than the pace."],
@@ -372,8 +470,10 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
             "Last 20 minutes slightly quicker if it feels controlled.",
             easy_window,
             f"It has been {_days(context.days_since_long)} days since your longest run. The weekly long run "
-            "is the highest-value session in marathon training — it builds the fatigue resistance nothing "
-            "else does. Keep it genuinely easy; the benefit is the duration, not the pace.",
+            "builds the aerobic base and fatigue resistance nothing else does — it matters for every "
+            f"distance, though it carries more of the work the longer the race. Capped at "
+            f"{racing.long_run_cap_km:.0f} km here, which is what {racing.label.lower()} asks for. "
+            "Keep it genuinely easy; the benefit is the duration, not the pace.",
             alternatives=["Split into two runs the same day only if the full distance is not realistic yet."],
         )
 
@@ -382,7 +482,17 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
             and (not math.isfinite(load.ratio) or load.ratio <= ACWR_CAUTION)):
         threshold, interval = zones["threshold"], zones["interval"]
 
+        speed_race = racing.emphasis == "intervals"
+
         if phase.name == "Taper":
+            if speed_race:
+                return Prescription(
+                    "Sharpener", 7.0,
+                    f"2 km easy → 4 × 400 m at {format_pace(interval)} with 2 min jog → 2 km easy.",
+                    f"Reps {_pace_window(interval, 4)}",
+                    f"Taper work for {racing.label.lower()} keeps race rhythm without adding fatigue: "
+                    f"race intensity, a fraction of the volume. Short reps because {racing.why}.",
+                )
             return Prescription(
                 "Sharpener", 8.0,
                 f"2 km easy → 3 × 1 km at threshold ({format_pace(threshold)}) with 2 min jog → 2 km easy.",
@@ -390,31 +500,52 @@ def next_session(context: RecentContext, load: LoadState, zones: dict[str, float
                 "Taper work keeps the legs sharp without adding fatigue: same intensity, much less of it.",
             )
 
-        # Alternate the stimulus — intervals after threshold, threshold after intervals.
-        do_intervals = context.days_since_quality >= 5
+        # Which session carries the block depends on the race. A 5 km is run near
+        # VO2max, so intervals are the staple and threshold the support; a
+        # marathon is the reverse, and its peak weeks belong to race-specific
+        # work rather than to the VO2max ceiling. A 10 km needs both, so it alternates.
+        if speed_race:
+            do_intervals = phase.name != "Base" or context.days_since_quality >= 5
+        elif racing.emphasis == "mixed":
+            do_intervals = context.days_since_quality >= 5
+        else:
+            do_intervals = context.days_since_quality >= 5 and phase.name in ("Build", "Base")
 
-        if do_intervals and phase.name in ("Build", "Base"):
+        if do_intervals:
+            reps, rep_m = (6, 800) if speed_race else (5, 1000)
+            total = round(4.0 + reps * rep_m / 1000.0 + reps * 0.4, 1)
             return Prescription(
-                "Intervals (VO2max)", 11.0,
-                f"2 km easy → 5 × 1 km at {format_pace(interval)} with 400 m jog recovery → 2 km easy.",
+                "Intervals (VO2max)", total,
+                f"2 km easy → {reps} × {rep_m} m at {format_pace(interval)} with 400 m jog "
+                "recovery → 2 km easy.",
                 f"Reps {_pace_window(interval, 4)}; recoveries genuinely slow",
                 f"{_days(context.days_since_quality)} days since your last quality session, and load is in range "
-                f"({load.ratio:.2f}×). Intervals lift maximal aerobic power — the ceiling that threshold work "
-                "then fills in underneath. Run the reps at the prescribed pace, not faster: going too hard "
-                "turns a VO2max session into a race and costs you the next three days.",
-                alternatives=[f"Feeling flat? Make it 4 × 1 km rather than pushing through five bad ones."],
+                f"({load.ratio:.2f}×). Intervals lift maximal aerobic power, and for "
+                f"{racing.label.lower()} that matters because {racing.why}. Run the reps at the prescribed "
+                "pace, not faster: going too hard turns a VO2max session into a race and costs you the "
+                "next three days.",
+                alternatives=[f"Feeling flat? Make it {reps - 1} × {rep_m} m rather than pushing through "
+                              f"{reps} bad ones."],
             )
 
-        work_km = 8.0 if phase.name == "Peak" else 6.0
+        rep_km = 1.0 if speed_race else 2.0
+        work_km = 5.0 if speed_race else (8.0 if phase.name == "Peak" else 6.0)
+        reps = max(2, round(work_km / rep_km))
+        if racing.emphasis == "threshold":
+            why_threshold = (f"Threshold raises the pace you can hold before lactate accumulates — for "
+                             f"{racing.label.lower()} that is the session that carries the block, because "
+                             f"{racing.why}.")
+        else:
+            why_threshold = (f"Threshold is the support session in a {racing.label.lower()} block: it raises "
+                             "the pace you can hold before lactate accumulates, which is what lets you "
+                             "absorb the interval work rather than merely survive it.")
         return Prescription(
-            "Threshold", round(work_km + 4.0, 1),
-            f"2 km easy → {work_km / 2:.0f} × 2 km at threshold ({format_pace(threshold)}) "
+            "Threshold", round(reps * rep_km + 4.0, 1),
+            f"2 km easy → {reps} × {rep_km:g} km at threshold ({format_pace(threshold)}) "
             f"with 90 s jog → 2 km easy.",
             f"Reps {_pace_window(threshold)}",
             f"{_days(context.days_since_quality)} days since quality work, load at "
-            f"{load.ratio:.2f}× your norm. Threshold is the highest-return session for a marathon: it "
-            "raises the pace you can hold before lactate accumulates, which is close to what the "
-            "marathon actually asks of you.",
+            f"{load.ratio:.2f}× your norm. " + why_threshold,
             alternatives=["A continuous 20–30 min tempo works too if you prefer it to broken reps."],
         )
 

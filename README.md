@@ -57,10 +57,30 @@ faster running scores more. The last 7 days are compared against the last 28
 divided by four. Around 1.0 means this week looks like your recent norm; above
 1.5 is the spike pattern worth interrupting.
 
-**Phase → what kind of session.** Weeks to race set the phase — base above 18
-weeks, build 18–8, peak 8–3, taper inside 3 — and the phase decides whether
-quality work means threshold reps, VO2max intervals, or marathon-pace segments
-inside the long run.
+**Race distance → the shape of the block.** The target distance drives the
+coaching layer, not only the VDOT maths. Each distance has a `RaceProfile` in
+`plan.py` carrying its phase boundaries, long-run cap, typical volume band and
+which quality session carries the block:
+
+| Race | Base / build / peak / taper (weeks out) | Long run cap | Emphasis |
+|---|---|---|---|
+| Marathon | >18 / 18–8 / 8–3 / <3 | 34 km | Threshold, plus race-pace segments in the long run |
+| Half marathon | >14 / 14–6 / 6–2 / <2 | 26 km | Threshold, plus race-pace segments |
+| 10 km | >12 / 12–5 / 5–1.5 / <1.5 | 20 km | Threshold and intervals, alternating |
+| 5 km | >10 / 10–4 / 4–1 / <1 | 16 km | Intervals, with threshold in support |
+
+This matters more than it looks. A 5 km block sharpens later and tapers for about
+a week rather than three, because there is far less accumulated fatigue to shed;
+its long runs are capped at 16 km, where a marathon's 34 km would be volume spent
+on an adaptation the race does not ask for; and its quality staple is VO2max
+interval work, because a 5 km is run close to VO2max while a marathon is run
+close to threshold. The volume band is keyed off distance **and** VDOT rather
+than finishing time — a 20-minute 5 km and the first 20 minutes of a marathon are
+not the same athlete.
+
+**Phase → what kind of session.** Within those boundaries the phase decides
+whether quality work means threshold reps, VO2max intervals, or race-pace
+segments inside the long run.
 
 **The decision tree,** in priority order:
 

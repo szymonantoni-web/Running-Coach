@@ -343,8 +343,49 @@ def test_phases_by_weeks_out():
     assert phase_for(None).name == "Off-season"
 
 
-def test_faster_goals_need_more_volume():
-    assert typical_peak_volume(3 * 3600)[0] > typical_peak_volume(4 * 3600)[0]
+def test_phase_boundaries_move_with_race_distance():
+    """A 5 km block sharpens later and tapers for days, not three weeks."""
+    assert phase_for(12, MARATHON_M).name == "Build"
+    assert phase_for(12, 5000).name == "Base"
+    # Two weeks out: a marathon is already tapering, a 5 km is still peaking.
+    assert phase_for(2, MARATHON_M).name == "Taper"
+    assert phase_for(2, 5000).name == "Peak"
+
+
+def test_faster_runners_need_more_volume():
+    assert typical_peak_volume(MARATHON_M, 53.5)[0] > typical_peak_volume(MARATHON_M, 45)[0]
+
+
+def test_longer_races_need_more_volume_at_equal_fitness():
+    marathon = typical_peak_volume(MARATHON_M, 50)
+    five_k = typical_peak_volume(5000, 50)
+    assert marathon[0] > five_k[0] and marathon[1] > five_k[1]
+
+
+def test_long_run_cap_follows_the_race():
+    """No 34 km long runs in a 5 km block."""
+    from plan import race_profile
+    assert race_profile(MARATHON_M).long_run_cap_km > race_profile(5000).long_run_cap_km
+    ctx = _context(days_since_long=7.0, longest_recent_km=30.0)
+    marathon = next_session(ctx, _load(1.0), ZONES, EASY_SLOW, phase_for(30, MARATHON_M),
+                            Goal(race_date=pd.Timestamp("2027-05-16")), 50.0)
+    five_k = next_session(ctx, _load(1.0), ZONES, EASY_SLOW, phase_for(30, 5000),
+                          Goal(distance_m=5000, goal_seconds=20 * 60,
+                               race_date=pd.Timestamp("2027-05-16"), label="5 km"), 50.0)
+    assert marathon.distance_km > five_k.distance_km
+    assert five_k.distance_km <= race_profile(5000).long_run_cap_km
+
+
+def test_quality_session_emphasis_follows_the_race():
+    """A 5 km peak week gets intervals; a marathon peak week gets threshold."""
+    ctx = _context(days_since_quality=4.0, days_since_long=1.0)
+    marathon = next_session(ctx, _load(1.0), ZONES, EASY_SLOW, phase_for(5, MARATHON_M),
+                            Goal(race_date=pd.Timestamp("2027-05-16")), 50.0)
+    five_k = next_session(ctx, _load(1.0), ZONES, EASY_SLOW, phase_for(2, 5000),
+                          Goal(distance_m=5000, goal_seconds=20 * 60,
+                               race_date=pd.Timestamp("2027-05-16"), label="5 km"), 50.0)
+    assert marathon.kind == "Threshold"
+    assert five_k.kind.startswith("Intervals")
 
 
 def _context(**overrides):
