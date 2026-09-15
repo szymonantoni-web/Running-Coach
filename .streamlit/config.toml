@@ -1,0 +1,15 @@
+# The chart palette is validated against a white surface, so the app pins the
+# light theme rather than following the viewer's system setting.
+[theme]
+base = "light"
+primaryColor = "#2a78d6"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f9f9f7"
+textColor = "#0b0b0b"
+
+[server]
+headless = true
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
