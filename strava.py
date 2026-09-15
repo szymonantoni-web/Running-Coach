@@ -231,15 +231,35 @@ def append_runs(runs: pd.DataFrame, added: list[dict]) -> pd.DataFrame:
     return combined.sort_values("date").reset_index(drop=True)
 
 
-def best_efforts(runs: pd.DataFrame, min_km: float = 3.0) -> pd.DataFrame:
-    """Candidate runs for estimating current fitness: the fastest sustained
-    efforts of at least `min_km`, most recent first.
+def best_efforts(runs: pd.DataFrame, min_km: float = 3.0,
+                 within_days: int | None = 56, as_of=None,
+                 limit: int = 10) -> pd.DataFrame:
+    """Candidate runs for estimating *current* fitness: the fastest sustained
+    efforts of at least `min_km` from the recent past, most recent first.
+
+    The recency window is the important argument. Ranking across a whole
+    imported history surfaces the fastest run of the last year, and a VDOT
+    taken from a months-old effort then propagates into every training pace,
+    every race prediction and the goal assessment — all of it describing
+    fitness the athlete may no longer have. Eight weeks is the default because
+    it is long enough to contain a hard effort for most people and short
+    enough that the result is still true.
+
+    Returns an empty frame when nothing qualifies, rather than quietly
+    widening the window — the caller decides what to tell the athlete.
 
     A whole-run average understates a race effort and overstates an interval
     session (whose average includes the jog recovery), so this is a starting
-    point the athlete confirms rather than an automatic answer.
+    point to confirm, not an automatic answer.
     """
     candidates = runs[runs["distance_km"] >= min_km].copy()
     if candidates.empty:
         return candidates
-    return candidates.sort_values("pace_sec_per_km").head(10).sort_values("date", ascending=False)
+
+    if within_days:
+        as_of = pd.Timestamp(as_of) if as_of is not None else candidates["date"].max()
+        candidates = candidates[candidates["date"] >= as_of - pd.Timedelta(days=within_days)]
+        if candidates.empty:
+            return candidates
+
+    return candidates.sort_values("pace_sec_per_km").head(limit).sort_values("date", ascending=False)

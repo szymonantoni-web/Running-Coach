@@ -36,7 +36,7 @@ PROFILE_SHEET = "profiles"
 RUNS_SHEET = "runs"
 
 PROFILE_COLUMNS = ["name", "goal_race", "goal_seconds", "race_date", "days_per_week",
-                   "effort_km", "effort_seconds", "updated_at"]
+                   "effort_km", "effort_seconds", "effort_date", "updated_at"]
 RUN_COLUMNS = ["profile", "date", "name", "type", "distance_km", "moving_seconds",
                "elevation_m", "avg_hr"]
 
@@ -58,6 +58,7 @@ class Profile:
     days_per_week: int = 4
     effort_km: float | None = None          # the reference effort behind the VDOT
     effort_seconds: float | None = None
+    effort_date: date | None = None         # when it was run — fitness estimates go stale
     updated_at: str = ""
 
     def touch(self) -> "Profile":
@@ -134,6 +135,7 @@ def profile_to_row(profile: Profile) -> list[str]:
         str(int(profile.days_per_week)),
         f"{profile.effort_km:.3f}" if profile.effort_km else "",
         f"{profile.effort_seconds:.0f}" if profile.effort_seconds else "",
+        profile.effort_date.isoformat() if profile.effort_date else "",
         profile.updated_at or "",
     ]
 
@@ -150,6 +152,9 @@ def row_to_profile(row: dict) -> Profile | None:
         days_per_week=_as_int(row.get("days_per_week"), 4),
         effort_km=_as_float(row.get("effort_km")),
         effort_seconds=_as_float(row.get("effort_seconds")),
+        # Absent from sheets written before this column existed, which reads
+        # as None rather than breaking — columns are matched by name.
+        effort_date=_as_date(row.get("effort_date")),
         updated_at=str(_clean(row.get("updated_at")) or ""),
     )
 

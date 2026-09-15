@@ -293,11 +293,30 @@ st.sidebar.caption(
     "the jog recoveries and understates you."
 )
 
-candidates = best_efforts(runs)
+effort_weeks = st.sidebar.slider(
+    "Only consider efforts from the last … weeks", 2, 26, 8,
+    help="Fitness estimated from an old effort propagates into every pace and "
+         "prediction in this app. Keep this short unless nothing recent qualifies.",
+)
+candidates = best_efforts(runs, within_days=effort_weeks * 7, as_of=runs["date"].max())
+widened = False
+if candidates.empty:
+    candidates = best_efforts(runs, within_days=None)
+    widened = not candidates.empty
+    if widened:
+        st.sidebar.warning(
+            f"No run of 3 km or more in the last {effort_weeks} weeks, so the list below "
+            "reaches further back. Treat the resulting fitness estimate as optimistic."
+        )
+
 saved_label = None
 if profile.effort_km and profile.effort_seconds:
+    age = ""
+    if profile.effort_date:
+        days = (today.date() - profile.effort_date).days
+        age = f", {days} d ago" if days < 400 else ""
     saved_label = (f"Saved: {profile.effort_km:.1f} km in "
-                   f"{format_duration(profile.effort_seconds)}")
+                   f"{format_duration(profile.effort_seconds)}{age}")
 
 effort_options = ([saved_label] if saved_label else []) + ["Enter it manually"] + [
     f"{row.date:%d %b} · {row['name'][:26]} · {row.distance_km:.1f} km · {format_pace(row.pace_sec_per_km)}"
@@ -306,8 +325,16 @@ effort_options = ([saved_label] if saved_label else []) + ["Enter it manually"] 
 default_index = 0 if saved_label else (1 if len(effort_options) > 1 else 0)
 picked = st.sidebar.selectbox("Best recent effort", effort_options, index=default_index)
 
+effort_date = None
 if saved_label and picked == saved_label:
     effort_km, effort_seconds = float(profile.effort_km), float(profile.effort_seconds)
+    effort_date = profile.effort_date
+    if effort_date and (today.date() - effort_date).days > effort_weeks * 7:
+        st.sidebar.warning(
+            f"That saved effort is {(today.date() - effort_date).days} days old — beyond your "
+            f"{effort_weeks}-week window. Every pace and prediction below is based on it, so "
+            "pick a more recent run if you have one."
+        )
 elif picked == "Enter it manually":
     col_a, col_b = st.sidebar.columns(2)
     effort_km = col_a.number_input("Distance (km)", min_value=1.0, max_value=50.0,
@@ -316,10 +343,12 @@ elif picked == "Enter it manually":
         "Time", value=format_duration(profile.effort_seconds) if profile.effort_seconds else "45:00",
         help="45:00, or 1:35:00")
     effort_seconds = parse_duration(effort_time)
+    effort_date = today.date()
 else:
     offset = 1 if saved_label else 0
     row = candidates.iloc[effort_options.index(picked) - 1 - offset]
     effort_km, effort_seconds = float(row.distance_km), float(row.moving_seconds)
+    effort_date = pd.Timestamp(row.date).date()
 
 if not math.isfinite(effort_seconds) or effort_seconds <= 0:
     st.sidebar.error("That time could not be read — try 45:00 or 1:35:00.")
@@ -358,7 +387,8 @@ if not is_demo:
                or profile.race_date != race_date
                or profile.days_per_week != days_per_week
                or (profile.effort_km or 0) != round(effort_km, 3)
-               or (profile.effort_seconds or 0) != round(effort_seconds))
+               or (profile.effort_seconds or 0) != round(effort_seconds)
+               or profile.effort_date != effort_date)
 
     if st.sidebar.button("💾 Save settings to profile", type="primary" if unsaved else "secondary",
                          disabled=not unsaved):
@@ -368,6 +398,7 @@ if not is_demo:
         profile.days_per_week = days_per_week
         profile.effort_km = round(effort_km, 3)
         profile.effort_seconds = round(effort_seconds)
+        profile.effort_date = effort_date
         store.save(profile, runs)
         _bump()
         _rerun_now()
@@ -686,8 +717,15 @@ with fitness_tab:
 
     with left:
         st.subheader("Your training paces")
+        when = ""
+        if effort_date:
+            days = (today.date() - effort_date).days
+            when = (" run today" if days <= 0 else
+                    " run yesterday" if days == 1 else f" run {days} days ago")
         st.caption(f"Derived from VDOT {vdot:.1f}, estimated from "
-                   f"{effort_km:.1f} km in {format_duration(effort_seconds)}.")
+                   f"{effort_km:.1f} km in {format_duration(effort_seconds)}{when}. "
+                   "Everything on this page moves with that one effort, so an old or "
+                   "unrepresentative one skews all of it.")
         rows = []
         for zone in ZONES:
             pace = zones[zone.key]

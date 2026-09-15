@@ -55,7 +55,8 @@ def sample_runs() -> pd.DataFrame:
 def sample_profile(name: str = "Szymon") -> Profile:
     return Profile(name=name, goal_race="Marathon", goal_seconds=10800,
                    race_date=date(2027, 5, 16), days_per_week=4,
-                   effort_km=11.0, effort_seconds=3376.0)
+                   effort_km=11.0, effort_seconds=3376.0,
+                   effort_date=date(2026, 9, 10))
 
 
 def both_stores():
@@ -254,6 +255,28 @@ def test_worksheets_are_created_with_headers():
     assert len(spreadsheet.raw("runs")) == 1 + 3
 
 
+def test_effort_date_round_trips():
+    original = sample_profile()
+    recovered = row_to_profile(dict(zip(PROFILE_COLUMNS, profile_to_row(original))))
+    assert recovered.effort_date == date(2026, 9, 10)
+
+
+def test_a_sheet_written_before_effort_date_existed_still_loads():
+    """Columns are matched by header name, so an older sheet without the
+    effort_date column loads with it as None rather than failing."""
+    spreadsheet = FakeSpreadsheet()
+    sheet = spreadsheet.add_worksheet("profiles")
+    sheet.seed([
+        ["name", "goal_race", "goal_seconds", "race_date", "days_per_week",
+         "effort_km", "effort_seconds", "updated_at"],
+        ["Szymon", "Marathon", "10800", "2027-05-16", "4", "11.0", "3376", ""],
+    ])
+    profile, _ = SheetsStore(spreadsheet).load("Szymon")
+    assert profile.name == "Szymon"
+    assert profile.effort_km == 11.0
+    assert profile.effort_date is None
+
+
 def test_columns_are_read_by_header_not_position():
     """Someone reorders the columns in the sheet by hand. It should still load."""
     spreadsheet = FakeSpreadsheet()
@@ -287,6 +310,59 @@ def test_everything_is_written_as_text():
     for title in ("profiles", "runs"):
         for row in spreadsheet.raw(title):
             assert all(isinstance(cell, str) for cell in row), title
+
+
+class _FlakySpreadsheet(FakeSpreadsheet):
+    """Raises a non-WorksheetNotFound error on the first read of each tab,
+    the way a rate limit or a transient 5xx does."""
+
+    def __init__(self):
+        super().__init__()
+        self.failed: set[str] = set()
+
+    def worksheet(self, title: str):
+        if title not in self.failed:
+            self.failed.add(title)
+            raise RuntimeError("APIError: [429]: Quota exceeded for reads")
+        return super().worksheet(title)
+
+
+class _RacingSpreadsheet(FakeSpreadsheet):
+    """The tab is absent on the read but present by the time we create it —
+    what happens when two Streamlit reruns both try to create it."""
+
+    def add_worksheet(self, title: str, rows: int = 1000, cols: int = 26):
+        sheet = super().add_worksheet(title, rows, cols)
+        self._added = getattr(self, "_added", 0) + 1
+        if self._added == 1:
+            raise RuntimeError(
+                'APIError: [400]: Invalid requests[0].addSheet: A sheet with the '
+                f'name "{title}" already exists. Please enter another name.')
+        return sheet
+
+
+def test_a_transient_read_error_is_not_mistaken_for_a_missing_tab():
+    """The bug this replaces: any read failure was treated as "tab absent",
+    so the code tried to create a tab that already existed and Google
+    rejected it with a confusing 400."""
+    store = SheetsStore(_FlakySpreadsheet())
+    raised = None
+    try:
+        store.save(sample_profile(), sample_runs())
+    except Exception as error:  # noqa: BLE001
+        raised = error
+    assert raised is not None, "a quota error must not be swallowed"
+    assert "429" in str(raised), f"the real error should surface, got: {raised}"
+
+
+def test_a_race_to_create_the_same_tab_recovers():
+    """Two reruns both find the tab missing; the loser gets 'already exists'
+    and should re-read rather than fail."""
+    store = SheetsStore(_RacingSpreadsheet())
+    store.save(sample_profile(), sample_runs())
+    profile, runs = store.load("Szymon")
+    assert profile.name == "Szymon"
+    assert len(runs) == 3
 
 
 def test_a_save_rewrites_rather_than_appending_forever():
