@@ -105,19 +105,42 @@ LOCAL_PROFILE_DIR = Path(__file__).parent / "data" / "profiles"
 
 
 @st.cache_resource(show_spinner=False)
-def _get_store() -> storage.StoreStatus:
-    """One store per server process. Cached as a resource because it holds an
-    authorised connection, which should not be rebuilt on every rerun."""
+def _get_store(_generation: int = 0) -> storage.StoreStatus:
+    """One store per server process, because it holds an authorised connection.
+
+    `_generation` exists so the sidebar's Reconnect button can force a fresh
+    one: a cached connection built before the credentials existed would
+    otherwise survive until the server is restarted, and report "no
+    credentials" long after that stopped being true.
+    """
+    secrets: dict = {}
+    secrets_error: str | None = None
     try:
-        secrets = dict(st.secrets)
-    except Exception:  # noqa: BLE001 — no secrets file at all is normal
-        secrets = {}
-    # On a hosted deploy the container's disk is wiped on restart, so local
-    # files are a cache rather than storage, and the app should say so.
-    on_cloud = bool(secrets.get("sheets", {}).get("hosted")) or \
-        "STREAMLIT_RUNTIME_ENV" in __import__("os").environ or \
-        "/mount/src" in str(Path(__file__).resolve())
-    return storage.get_store(secrets, LOCAL_PROFILE_DIR, local_is_durable=not on_cloud)
+        secrets = {key: st.secrets[key] for key in st.secrets}
+    except Exception as error:  # noqa: BLE001 — no secrets file at all is normal
+        secrets_error = f"{type(error).__name__}: {error}"
+
+    # Streamlit Community Cloud checks the repository out under /mount/src and
+    # wipes that disk on every restart, which is what makes local files a cache
+    # there rather than storage. Nothing else is a reliable marker —
+    # STREAMLIT_RUNTIME_ENV is set when running locally too, so testing for it
+    # made every local run claim to be a deploy.
+    on_cloud = "/mount/src" in str(Path(__file__).resolve())
+
+    status = storage.get_store(secrets, LOCAL_PROFILE_DIR, local_is_durable=not on_cloud)
+
+    # Never fail silently: if credentials were expected but not found, say what
+    # was actually seen and where the file was looked for.
+    if status.error is None and not secrets.get("gcp_service_account"):
+        status.error = (
+            (f"Could not read secrets — {secrets_error}." if secrets_error else
+             f"No [gcp_service_account] section found. Sections seen: "
+             f"{sorted(secrets) if secrets else 'none'}.")
+            + f"\n\nStreamlit looks for secrets.toml relative to the folder you ran it from."
+            + f"\nThat folder is currently: {Path.cwd()}"
+            + f"\nSo it expects: {Path.cwd() / '.streamlit' / 'secrets.toml'}"
+        )
+    return status
 
 
 @st.cache_data(show_spinner=False)
@@ -135,7 +158,8 @@ def _bump() -> None:
     st.session_state["data_version"] = st.session_state.get("data_version", 0) + 1
 
 
-store_status = _get_store()
+st.session_state.setdefault("store_generation", 0)
+store_status = _get_store(st.session_state["store_generation"])
 store = store_status.store
 st.session_state.setdefault("data_version", 0)
 
@@ -155,14 +179,23 @@ if chosen != st.session_state["active_profile"]:
     _rerun_now()
 
 # -- storage status --------------------------------------------------------
-if store_status.durable:
+if store_status.durable and store_status.label == "Google Sheets":
     st.sidebar.caption(f"💾 {store_status.label} — saved automatically.")
+elif store_status.durable:
+    st.sidebar.caption(f"💾 {store_status.label} — saved on this machine.")
 else:
-    st.sidebar.caption(f"⚠️ {store_status.label} — **not** durable on this deploy.")
+    st.sidebar.caption(f"⚠️ {store_status.label} — **not** durable here.")
+
 if store_status.error:
-    with st.sidebar.expander("Storage problem"):
+    with st.sidebar.expander("⚠️ Why storage isn't connected", expanded=True):
         st.caption(store_status.detail)
         st.code(store_status.error, language=None)
+        st.caption("If you added credentials since this app started, reconnect rather "
+                   "than restarting — the connection is cached per session.")
+        if st.button("🔄 Reconnect storage", key="reconnect_storage"):
+            _get_store.clear()
+            st.session_state["store_generation"] += 1
+            _rerun_now()
 
 # -- creating a profile ----------------------------------------------------
 if chosen == NEW_PROFILE:

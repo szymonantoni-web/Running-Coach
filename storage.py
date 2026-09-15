@@ -268,6 +268,15 @@ class LocalStore:
         self._path(name).unlink(missing_ok=True)
 
 
+def _is_missing_worksheet(error: Exception) -> bool:
+    """Is this "that tab isn't there", or something else entirely?
+
+    Matched on the exception's class name rather than by importing gspread, so
+    this module stays importable — and testable — without it.
+    """
+    return type(error).__name__ == "WorksheetNotFound"
+
+
 class SheetsStore:
     """Profiles in a Google Spreadsheet: one `profiles` worksheet, one `runs`.
 
@@ -286,14 +295,34 @@ class SheetsStore:
         self.spreadsheet = spreadsheet
 
     def _worksheet(self, title: str, columns: list[str]):
-        """Fetch a worksheet, creating it with its header row if absent."""
+        """Fetch a worksheet, creating it with its header row if absent.
+
+        Two failure modes this has to survive, both of which produced a
+        confusing 400 before:
+
+        * gspread raises `WorksheetNotFound` when a tab is absent, but the same
+          call also raises on a rate limit or a transient 5xx. Treating every
+          error as "absent" makes the next line try to create a tab that is
+          already there.
+        * Streamlit reruns fire fast enough that two of them can both find the
+          tab missing and both try to create it. The loser gets "already
+          exists" — which is not an error worth surfacing, just a signal to
+          re-read.
+        """
         try:
             worksheet = self.spreadsheet.worksheet(title)
-        except Exception:  # noqa: BLE001 — gspread raises WorksheetNotFound
-            worksheet = self.spreadsheet.add_worksheet(title=title, rows=1000,
-                                                       cols=max(len(columns), 8))
-            worksheet.append_rows([columns], value_input_option="RAW")
-            return worksheet
+        except Exception as error:  # noqa: BLE001 — narrowed immediately below
+            if not _is_missing_worksheet(error):
+                raise
+            try:
+                worksheet = self.spreadsheet.add_worksheet(
+                    title=title, rows=1000, cols=max(len(columns), 8))
+                worksheet.append_rows([columns], value_input_option="RAW")
+                return worksheet
+            except Exception as create_error:  # noqa: BLE001
+                if "already exists" not in str(create_error).lower():
+                    raise
+                worksheet = self.spreadsheet.worksheet(title)
 
         if not worksheet.get_all_values():
             worksheet.append_rows([columns], value_input_option="RAW")
