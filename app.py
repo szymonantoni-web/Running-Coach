@@ -162,8 +162,14 @@ def _get_store(_generation: int = 0) -> storage.StoreStatus:
 RELOAD_AFTER_SECONDS = 45
 
 
+# When each cached history was actually read, keyed the same way as the cache.
+# A side table rather than part of the cached value, because the cached value
+# has to survive being pickled and this does not need to.
+_LOAD_TIMES: dict[tuple[str, int], pd.Timestamp] = {}
+
+
 @st.cache_data(show_spinner=False, ttl=RELOAD_AFTER_SECONDS)
-def _load_profile(_store, name: str, version: int):
+def _cached_profile(_store, name: str, version: int):
     """Load a profile and its runs, cached briefly.
 
     `version` is bumped on every write *this browser session* makes, which is
@@ -171,16 +177,43 @@ def _load_profile(_store, name: str, version: int):
     the only invalidation, because it cannot see anybody else's writes: it
     lives in `st.session_state`, which is per browser session, while the cache
     is shared by the whole server process. So a run added in one place — the
-    deployed app, a second tab, the app running on your laptop, your
-    girlfriend's browser — bumped only that session's counter, and every other
+    deployed app, a second tab, the app running on your laptop, another
+    person's browser — bumped only that session's counter, and every other
     session went on serving the history it had cached before, indefinitely.
-    That is the bug this TTL fixes: without it the Google Sheet was the shared
+    That is what the TTL fixes: without it the Google Sheet was the shared
     source of truth in name only.
+
+    What comes back is deliberately dull: a list of strings and a DataFrame,
+    never a `Profile`. `st.cache_data` pickles whatever it is given, and a
+    custom class is the usual reason that fails — the deployed app died with
+    an unserializable-return error that could not be reproduced locally, and
+    the cheapest durable answer is to keep custom classes out of the cache
+    rather than to keep guessing at which one it objected to.
 
     `_store` is underscore-prefixed so Streamlit does not try to hash it.
     """
     profile, runs = _store.load(name)
-    return profile, runs, pd.Timestamp.now()
+    _LOAD_TIMES[(name, version)] = pd.Timestamp.now()
+    return storage.profile_to_row(profile), runs
+
+
+def _load_profile(store_obj, name: str, version: int):
+    """The cached load, with a direct read as a fallback.
+
+    Caching is an optimisation. If it ever fails — a pickling problem, a
+    Streamlit version that dislikes something in the payload — the right
+    outcome is a slower app that works, not a red screen with no way past it.
+    """
+    try:
+        row, runs = _cached_profile(store_obj, name, version)
+        loaded = _LOAD_TIMES.get((name, version), pd.Timestamp.now())
+        cache_error = None
+    except Exception as error:  # noqa: BLE001 — deliberately broad; see docstring
+        profile_obj, runs = store_obj.load(name)
+        return profile_obj, runs, pd.Timestamp.now(), f"{type(error).__name__}: {error}"
+
+    profile_obj = storage.row_to_profile(dict(zip(storage.PROFILE_COLUMNS, row)))
+    return profile_obj or storage.Profile(name=name), runs, loaded, cache_error
 
 
 def _bump() -> None:
@@ -189,7 +222,8 @@ def _bump() -> None:
 
 def _reload_now() -> None:
     """Drop every cached history and re-read from storage."""
-    _load_profile.clear()
+    _cached_profile.clear()
+    _LOAD_TIMES.clear()
     _bump()
 
 
@@ -272,8 +306,15 @@ if chosen == NEW_PROFILE:
     st.stop()
 
 profile_name = chosen
-profile, runs, loaded_at = _load_profile(store, profile_name,
-                                         st.session_state["data_version"])
+profile, runs, loaded_at, cache_error = _load_profile(
+    store, profile_name, st.session_state["data_version"])
+
+if cache_error:
+    st.sidebar.warning(
+        "Caching is off for this session — the history is being read fresh on every "
+        "interaction, which is slower but correct."
+    )
+    st.sidebar.caption(f"Reason: {cache_error}")
 
 # How current is what you are looking at? Worth stating rather than assuming:
 # another browser, another device or the app running on your laptop can all

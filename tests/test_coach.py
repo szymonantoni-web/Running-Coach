@@ -772,6 +772,47 @@ def test_app_module_level_names_are_assigned_before_use():
     assert not problems, "app.py uses names before assigning them: " + "; ".join(problems)
 
 
+
+def test_profile_row_round_trip_is_lossless():
+    """app.py caches a profile as its spreadsheet row rather than as a Profile,
+    to keep custom classes out of anything Streamlit has to pickle. That is
+    only safe if the round trip loses nothing."""
+    import datetime
+    import storage
+
+    original = storage.Profile(
+        name="Szymon", goal_race="Half marathon", goal_seconds=95 * 60,
+        race_date=datetime.date(2026, 12, 18), days_per_week=5,
+        effort_km=11.9, effort_seconds=3284.0,
+        effort_date=datetime.date(2026, 9, 10), updated_at="2026-09-16T08:00:00",
+    )
+    row = storage.profile_to_row(original)
+    restored = storage.row_to_profile(dict(zip(storage.PROFILE_COLUMNS, row)))
+    assert restored == original, f"{restored} != {original}"
+
+    # And an empty profile survives it too — every optional field is None.
+    empty = storage.Profile(name="Marta")
+    assert storage.row_to_profile(
+        dict(zip(storage.PROFILE_COLUMNS, storage.profile_to_row(empty)))) == empty
+
+
+def test_the_cached_payload_contains_no_custom_classes():
+    """Whatever app.py hands to st.cache_data has to pickle. Strings, numbers
+    and a DataFrame always will; a class defined in this repo is the usual
+    thing that does not."""
+    import pickle
+    import storage
+
+    runs = demo_runs()
+    row = storage.profile_to_row(storage.Profile(name="Szymon", effort_km=11.9,
+                                                 effort_seconds=3284.0))
+    payload = (row, runs)
+    restored_row, restored_runs = pickle.loads(pickle.dumps(payload))
+    assert restored_row == row
+    assert len(restored_runs) == len(runs)
+    assert all(isinstance(cell, str) for cell in row)
+
+
 if __name__ == "__main__":
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]
