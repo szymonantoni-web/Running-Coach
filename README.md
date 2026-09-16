@@ -151,6 +151,14 @@ Worth reading before you trust any of it.
 - **Everything here is a population average.** The most useful thing you can do is
   keep your own records and find out where you differ.
 
+- **Two people sharing one sheet see each other's runs within a minute, not
+  instantly.** A loaded history is cached for 45 seconds before it is re-read,
+  so the Sheets API is not hit on every click. The 🔄 next to the storage line
+  in the sidebar forces a re-read immediately. (Before this was added the cache
+  was invalidated only by writes from *your own* browser session, so a run added
+  anywhere else — the deployed app, a second tab, your laptop — never appeared
+  in the others at all.)
+
 Not medical advice. If something hurts in a way that is sharp, one-sided or
 getting worse, no algorithm is the right thing to ask.
 

@@ -146,15 +146,43 @@ def _get_store(_generation: int = 0) -> storage.StoreStatus:
     return status
 
 
-@st.cache_data(show_spinner=False)
+# How long a loaded history is trusted before it is re-read from storage.
+# This exists because `version` below is not enough on its own — see the
+# docstring. Short enough that a run added elsewhere shows up while you are
+# still looking at the app; long enough that clicking between tabs does not
+# hit the Sheets API on every rerun.
+RELOAD_AFTER_SECONDS = 45
+
+
+@st.cache_data(show_spinner=False, ttl=RELOAD_AFTER_SECONDS)
 def _load_profile(_store, name: str, version: int):
-    """`version` is bumped on every write, which is what invalidates the cache.
-    `_store` is underscore-prefixed so Streamlit does not try to hash it."""
-    return _store.load(name)
+    """Load a profile and its runs, cached briefly.
+
+    `version` is bumped on every write *this browser session* makes, which is
+    what makes your own additions appear immediately. It is deliberately not
+    the only invalidation, because it cannot see anybody else's writes: it
+    lives in `st.session_state`, which is per browser session, while the cache
+    is shared by the whole server process. So a run added in one place — the
+    deployed app, a second tab, the app running on your laptop, your
+    girlfriend's browser — bumped only that session's counter, and every other
+    session went on serving the history it had cached before, indefinitely.
+    That is the bug this TTL fixes: without it the Google Sheet was the shared
+    source of truth in name only.
+
+    `_store` is underscore-prefixed so Streamlit does not try to hash it.
+    """
+    profile, runs = _store.load(name)
+    return profile, runs, pd.Timestamp.now()
 
 
 def _bump() -> None:
     st.session_state["data_version"] = st.session_state.get("data_version", 0) + 1
+
+
+def _reload_now() -> None:
+    """Drop every cached history and re-read from storage."""
+    _load_profile.clear()
+    _bump()
 
 
 st.session_state.setdefault("store_generation", 0)
@@ -236,7 +264,23 @@ if chosen == NEW_PROFILE:
     st.stop()
 
 profile_name = chosen
-profile, runs = _load_profile(store, profile_name, st.session_state["data_version"])
+profile, runs, loaded_at = _load_profile(store, profile_name,
+                                         st.session_state["data_version"])
+
+# How current is what you are looking at? Worth stating rather than assuming:
+# another browser, another device or the app running on your laptop can all
+# write to the same sheet, and this page only re-reads it every
+# RELOAD_AFTER_SECONDS.
+if store_status.durable:
+    _age = max(0, int((pd.Timestamp.now() - loaded_at).total_seconds()))
+    _freshness, _button = st.sidebar.columns([3, 1])
+    _freshness.caption(
+        f"Read {'just now' if _age < 5 else f'{_age}s ago'}"
+        + (f" · auto every {RELOAD_AFTER_SECONDS}s" if store_status.label == "Google Sheets" else "")
+    )
+    if _button.button("🔄", key="reload_runs", help="Re-read this profile from storage now"):
+        _reload_now()
+        _rerun_now()
 
 
 def save_runs(updated: pd.DataFrame) -> None:
