@@ -710,6 +710,68 @@ def test_a_sheet_written_before_the_column_existed_still_loads():
     assert AUTO_SESSION.label not in back["session_type"].iloc[0]
 
 
+
+# --------------------------------------------------------------------------
+# app.py — the layout module is a script, so a name used above where it is
+# assigned is a NameError at import, not at call time. Streamlit reports it as
+# a redacted crash on page load with no way to reach the app, so it is worth
+# catching here rather than in production.
+# --------------------------------------------------------------------------
+
+def test_app_module_level_names_are_assigned_before_use():
+    import ast
+
+    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # Names bound at module level, and where. Function and class bodies are
+    # skipped: those run later, by which point the module has finished.
+    assigned: dict[str, int] = {}
+    for node in tree.body:
+        for child in ast.walk(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                assigned.setdefault(child.id, child.lineno)
+            elif isinstance(child, ast.alias):
+                bound = (child.asname or child.name).split(".")[0]
+                assigned.setdefault(bound, getattr(node, "lineno", 0))
+
+    # Anything defined inside a function body is not a module-level binding,
+    # so collect those separately to avoid flagging them as undefined.
+    nested = {node.name for node in ast.walk(tree)
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+
+    # Comprehension targets bind before the element expression runs, but the
+    # element is written first, so a naive line comparison flags every
+    # `[f(row) for row in rows]`. Exclude them; the same goes for loop targets.
+    scoped: set[str] = set()
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.comprehension):
+            targets = [node.target]
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.withitem)):
+            target = getattr(node, "target", None) or getattr(node, "optional_vars", None)
+            targets = [target] if target is not None else []
+        for target in targets:
+            scoped.update(child.id for child in ast.walk(target)
+                          if isinstance(child, ast.Name))
+
+    problems = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for child in ast.walk(node):
+            if not (isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)):
+                continue
+            first = assigned.get(child.id)
+            if (first is not None and first > child.lineno
+                    and child.id not in nested and child.id not in scoped):
+                problems.append(f"{child.id} used on line {child.lineno}, "
+                                f"assigned on line {first}")
+    assert not problems, "app.py uses names before assigning them: " + "; ".join(problems)
+
+
 if __name__ == "__main__":
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]

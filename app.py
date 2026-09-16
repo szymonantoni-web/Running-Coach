@@ -57,6 +57,14 @@ st.set_page_config(page_title="Strava Coach", page_icon="🏃", layout="wide",
 
 STATUS_ICON = {"good": "✅", "warning": "⚠️", "serious": "🟠", "critical": "🛑", "muted": "•"}
 
+# Defined here, at the top, because the sidebar uses it several hundred lines
+# before the analysis section does. It used to be assigned down there, which
+# worked only by accident: every sidebar use sits behind a truthiness check on
+# the profile's saved effort date, and that field was blank for every profile
+# written before it was added. The first profile saved with a date in it turned
+# a latent NameError into a crash on load.
+today = pd.Timestamp(pd.Timestamp.today().date())
+
 
 # --------------------------------------------------------------------------
 # Streamlit compatibility shims — the width argument was renamed; try the new
@@ -458,7 +466,6 @@ with st.sidebar.expander("Delete this profile"):
             st.session_state["active_profile"] = remaining[0] if remaining else NEW_PROFILE
             _rerun_now()
 
-today = pd.Timestamp(pd.Timestamp.today().date())
 as_of = max(today, runs["date"].max())
 
 # --------------------------------------------------------------------------
